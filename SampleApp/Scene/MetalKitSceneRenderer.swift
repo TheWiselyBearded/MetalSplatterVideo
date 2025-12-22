@@ -27,6 +27,12 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 
     var drawableSize: CGSize = .zero
 
+    // Sequence playback properties
+    var sequenceURLs: [URL] = []
+    var currentSequenceIndex: Int = 0
+    var lastSequenceChangeTimestamp: Date? = nil
+    var sequenceInterval: TimeInterval = 0.5  // Time between frames (seconds)
+
     init?(_ metalKitView: MTKView) {
         self.device = metalKitView.device!
         guard let queue = self.device.makeCommandQueue() else { return nil }
@@ -43,6 +49,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         self.model = model
 
         modelRenderer = nil
+        sequenceURLs = []
+        currentSequenceIndex = 0
+        lastSequenceChangeTimestamp = nil
+        
         switch model {
         case .gaussianSplat(let url):
             let splat = try await SplatRenderer(device: device,
@@ -53,6 +63,12 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                 maxSimultaneousRenders: Constants.maxSimultaneousRenders)
             try await splat.read(from: url)
             modelRenderer = splat
+        case .gaussianSplatSequence(let urls):
+            guard !urls.isEmpty else { break }
+            sequenceURLs = urls
+            currentSequenceIndex = 0
+            lastSequenceChangeTimestamp = Date()
+            try await loadSequenceFrame(at: 0)
         case .sampleBox:
             modelRenderer = try! await SampleBoxRenderer(device: device,
                                                          colorFormat: metalKitView.colorPixelFormat,
@@ -62,6 +78,67 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders)
         case .none:
             break
+        }
+    }
+
+    private func loadSequenceFrame(at index: Int) async throws {
+        guard index < sequenceURLs.count else { return }
+        let url = sequenceURLs[index]
+        
+        let totalStartTime = CFAbsoluteTimeGetCurrent()
+        
+        // Time renderer initialization
+        let initStartTime = CFAbsoluteTimeGetCurrent()
+        let splat = try await SplatRenderer(device: device,
+                                            colorFormat: metalKitView.colorPixelFormat,
+                                            depthFormat: metalKitView.depthStencilPixelFormat,
+                                            sampleCount: metalKitView.sampleCount,
+                                            maxViewCount: 1,
+                                            maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+        let initTime = (CFAbsoluteTimeGetCurrent() - initStartTime) * 1000
+        
+        // Time file reading/parsing
+        let readStartTime = CFAbsoluteTimeGetCurrent()
+        try await splat.read(from: url)
+        let readTime = (CFAbsoluteTimeGetCurrent() - readStartTime) * 1000
+        
+        let totalTime = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000
+        
+        // Get file size for context
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+        let fileSizeMB = Double(fileSize) / (1024 * 1024)
+        
+        modelRenderer = splat
+        currentSequenceIndex = index
+        
+        Self.log.info("""
+            📊 Splat [\(index + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent)
+               File: \(String(format: "%.2f", fileSizeMB)) MB
+               Init: \(String(format: "%.1f", initTime)) ms
+               Read: \(String(format: "%.1f", readTime)) ms
+               Total: \(String(format: "%.1f", totalTime)) ms
+            """)
+    }
+
+    private func updateSequence() {
+        guard !sequenceURLs.isEmpty else { return }
+        
+        let now = Date()
+        guard let lastChange = lastSequenceChangeTimestamp else {
+            lastSequenceChangeTimestamp = now
+            return
+        }
+        
+        if now.timeIntervalSince(lastChange) >= sequenceInterval {
+            lastSequenceChangeTimestamp = now
+            let nextIndex = (currentSequenceIndex + 1) % sequenceURLs.count
+            Task {
+                do {
+                    try await loadSequenceFrame(at: nextIndex)
+                } catch {
+                    Self.log.error("Failed to load sequence frame: \(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -97,6 +174,9 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        // Update sequence if we're playing a sequence
+        updateSequence()
+        
         guard let modelRenderer else { return }
         guard let drawable = view.currentDrawable else { return }
 
@@ -111,8 +191,6 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         commandBuffer.addCompletedHandler { (_ commandBuffer)-> Swift.Void in
             semaphore.signal()
         }
-
-        updateRotation()
 
         do {
             try modelRenderer.render(viewports: [viewport],

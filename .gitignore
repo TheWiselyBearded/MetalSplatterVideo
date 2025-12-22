@@ -3,3 +3,6 @@ xcuserdata
 DerivedData/
 .swiftpm
 
+
+# Ignore Core ML model packages
+SampleApp/Models/**/*.mlpackage/
