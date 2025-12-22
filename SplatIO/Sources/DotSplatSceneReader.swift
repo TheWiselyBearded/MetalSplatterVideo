@@ -24,7 +24,8 @@ public class DotSplatSceneReader: SplatSceneReader {
     }
 
     public func read(to delegate: any SplatSceneReaderDelegate) {
-        let bufferSize = 64*1024
+        // Use larger buffer (1MB) for better disk throughput on large files
+        let bufferSize = 1024*1024
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
         defer { buffer.deallocate() }
 

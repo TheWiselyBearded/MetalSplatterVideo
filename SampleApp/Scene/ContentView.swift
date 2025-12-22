@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var isProcessing = false
     @State private var sharpModel: MLModel?
     @State private var modelLoadStatus: String?
+    @AppStorage("preloadAllFrames") private var preloadAllFrames = false
 
 #if os(macOS)
     @Environment(\.openWindow) private var openWindow
@@ -47,7 +48,7 @@ struct ContentView: View {
         NavigationStack(path: $navigationPath) {
             mainView
                 .navigationDestination(for: ModelIdentifier.self) { modelIdentifier in
-                    MetalKitSceneView(modelIdentifier: modelIdentifier)
+                    MetalKitSceneView(modelIdentifier: modelIdentifier, preloadAllFrames: preloadAllFrames)
                         .navigationTitle(modelIdentifier.description)
                 }
         }
@@ -245,6 +246,10 @@ end_header
                 }
             }
 
+            Toggle("Preload all frames into memory", isOn: $preloadAllFrames)
+                .padding(.horizontal)
+                .help("Load all frames at once for smoother playback (uses more memory)")
+            
             Button("Read PLY Directory (Sequence)") {
                 isPickingDirectory = true
             }

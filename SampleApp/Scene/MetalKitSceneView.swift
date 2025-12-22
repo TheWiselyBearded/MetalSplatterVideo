@@ -11,6 +11,7 @@ private typealias ViewRepresentable = UIViewRepresentable
 
 struct MetalKitSceneView: ViewRepresentable {
     var modelIdentifier: ModelIdentifier?
+    var preloadAllFrames: Bool = false
 
     class Coordinator {
         var renderer: MetalKitSceneRenderer?
@@ -38,6 +39,7 @@ struct MetalKitSceneView: ViewRepresentable {
         }
 
         let renderer = MetalKitSceneRenderer(metalKitView)
+        renderer?.preloadAllFrames = preloadAllFrames
         coordinator.renderer = renderer
         metalKitView.delegate = renderer
 
@@ -64,6 +66,7 @@ struct MetalKitSceneView: ViewRepresentable {
 
     private func updateView(_ coordinator: Coordinator) {
         guard let renderer = coordinator.renderer else { return }
+        renderer.preloadAllFrames = preloadAllFrames
         Task {
             do {
                 try await renderer.load(modelIdentifier)

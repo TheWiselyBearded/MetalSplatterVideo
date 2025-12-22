@@ -181,6 +181,7 @@ public class SplatRenderer {
     public var splatCount: Int { splatBuffer.count }
 
     var sorting = false
+    var sortCancelled = false
     var orderAndDepthTempSort: [SplatIndexAndDepth] = []
 
     public init(device: MTLDevice,
@@ -219,14 +220,36 @@ public class SplatRenderer {
     }
 
     public func reset() {
+        // Cancel any ongoing sort and wait for it to complete
+        sortCancelled = true
+        while sorting {
+            Thread.sleep(forTimeInterval: 0.001) // 1ms sleep while waiting
+        }
+        sortCancelled = false
+        
         splatBuffer.count = 0
+        splatBufferPrime.count = 0
         try? splatBuffer.setCapacity(0)
+        try? splatBufferPrime.setCapacity(0)
+        orderAndDepthTempSort.removeAll()
     }
 
     public func read(from url: URL) async throws {
         var newPoints = SplatMemoryBuffer()
         try await newPoints.read(from: try AutodetectSceneReader(url))
         try add(newPoints.points)
+    }
+
+    /// Load new data from URL, resetting existing data first. More efficient than creating a new renderer.
+    public func load(from url: URL) async throws {
+        reset()
+        try await read(from: url)
+    }
+
+    /// Load points directly without file I/O. Useful for preloaded data.
+    public func load(points: [SplatScenePoint]) throws {
+        reset()
+        try add(points)
     }
 
     private func resetPipelineStates() {
@@ -572,6 +595,7 @@ public class SplatRenderer {
     // Sort splatBuffer (read-only), storing the results in splatBuffer (write-only) then swap splatBuffer and splatBufferPrime
     public func resort() {
         guard !sorting else { return }
+        guard !sortCancelled else { return }
         sorting = true
         onSortStart?()
         let sortStartTime = Date()
@@ -586,35 +610,48 @@ public class SplatRenderer {
                 sorting = false
                 onSortComplete?(-sortStartTime.timeIntervalSinceNow)
             }
+            
+            // Check for cancellation before starting
+            guard !sortCancelled else { return }
+            guard splatCount > 0 else { return }
 
             if orderAndDepthTempSort.count != splatCount {
                 orderAndDepthTempSort = Array(repeating: SplatIndexAndDepth(index: .max, depth: 0), count: splatCount)
             }
 
+            // Check for cancellation periodically during sorting
             if Constants.sortByDistance {
                 for i in 0..<splatCount {
+                    if sortCancelled { return }
                     orderAndDepthTempSort[i].index = UInt32(i)
                     let splatPosition = splatBuffer.values[i].position.simd
                     orderAndDepthTempSort[i].depth = (splatPosition - cameraWorldPosition).lengthSquared
                 }
             } else {
                 for i in 0..<splatCount {
+                    if sortCancelled { return }
                     orderAndDepthTempSort[i].index = UInt32(i)
                     let splatPosition = splatBuffer.values[i].position.simd
                     orderAndDepthTempSort[i].depth = dot(splatPosition, cameraWorldForward)
                 }
             }
+            
+            guard !sortCancelled else { return }
 
             orderAndDepthTempSort.sort { $0.depth > $1.depth }
+            
+            guard !sortCancelled else { return }
 
             do {
                 try splatBufferPrime.setCapacity(splatCount)
                 splatBufferPrime.count = 0
                 for newIndex in 0..<orderAndDepthTempSort.count {
+                    if sortCancelled { return }
                     let oldIndex = Int(orderAndDepthTempSort[newIndex].index)
                     splatBufferPrime.append(splatBuffer, fromIndex: oldIndex)
                 }
 
+                guard !sortCancelled else { return }
                 swap(&splatBuffer, &splatBufferPrime)
             } catch {
                 // TODO: report error

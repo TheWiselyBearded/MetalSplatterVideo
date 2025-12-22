@@ -12,8 +12,11 @@ struct SampleApp: App {
 
 #if os(macOS)
         WindowGroup(for: ModelIdentifier.self) { modelIdentifier in
-            MetalKitSceneView(modelIdentifier: modelIdentifier.wrappedValue)
-                .navigationTitle(modelIdentifier.wrappedValue?.description ?? "No Model")
+            MetalKitSceneView(
+                modelIdentifier: modelIdentifier.wrappedValue,
+                preloadAllFrames: UserDefaults.standard.bool(forKey: "preloadAllFrames")
+            )
+            .navigationTitle(modelIdentifier.wrappedValue?.description ?? "No Model")
         }
 #endif // os(macOS)
 
@@ -21,6 +24,8 @@ struct SampleApp: App {
         ImmersiveSpace(for: ModelIdentifier.self) { modelIdentifier in
             CompositorLayer(configuration: ContentStageConfiguration()) { layerRenderer in
                 let renderer = VisionSceneRenderer(layerRenderer)
+                // Get preload setting from UserDefaults
+                renderer.preloadAllFrames = UserDefaults.standard.bool(forKey: "preloadAllFrames")
                 Task {
                     do {
                         try await renderer.load(modelIdentifier.wrappedValue)

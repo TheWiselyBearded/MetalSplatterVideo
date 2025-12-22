@@ -31,7 +31,19 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var sequenceURLs: [URL] = []
     var currentSequenceIndex: Int = 0
     var lastSequenceChangeTimestamp: Date? = nil
-    var sequenceInterval: TimeInterval = 0.5  // Time between frames (seconds)
+    var sequenceInterval: TimeInterval = 1.0 / 30.0  // 30 FPS
+    
+    // Performance optimizations: renderer reuse and preloading
+    private var splatRenderer: SplatRenderer?
+    private var nextFrameRenderer: SplatRenderer?
+    private var loadingNextFrame = false
+    
+    // Preload-all frames option
+    var preloadAllFrames: Bool = false
+    private var preloadedFrames: [Int: SplatRenderer] = [:]
+    private var preloadingAllTask: Task<Void, Never>?
+    private var preloadProgress: (current: Int, total: Int) = (0, 0)
+    var onPreloadProgress: ((Int, Int) -> Void)?  // Callback for progress updates
 
     init?(_ metalKitView: MTKView) {
         self.device = metalKitView.device!
@@ -53,6 +65,15 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         currentSequenceIndex = 0
         lastSequenceChangeTimestamp = nil
         
+        // Clean up preloading
+        nextFrameRenderer = nil
+        loadingNextFrame = false
+        splatRenderer = nil
+        preloadedFrames.removeAll()
+        preloadingAllTask?.cancel()
+        preloadingAllTask = nil
+        preloadProgress = (0, 0)
+        
         switch model {
         case .gaussianSplat(let url):
             let splat = try await SplatRenderer(device: device,
@@ -68,7 +89,22 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             sequenceURLs = urls
             currentSequenceIndex = 0
             lastSequenceChangeTimestamp = Date()
-            try await loadSequenceFrame(at: 0)
+            
+            if preloadAllFrames {
+                // Load first frame synchronously, then preload all others
+                try await loadSequenceFrame(at: 0)
+                // Add frame 0 to preloaded cache immediately
+                if let renderer = splatRenderer {
+                    preloadedFrames[0] = renderer
+                }
+                preloadingAllTask = Task { [weak self] in
+                    await self?.preloadAllFrames()
+                }
+            } else {
+                // Original behavior: load first frame, then preload next
+                try await loadSequenceFrame(at: 0)
+                loadNextFrameInBackground()
+            }
         case .sampleBox:
             modelRenderer = try! await SampleBoxRenderer(device: device,
                                                          colorFormat: metalKitView.colorPixelFormat,
@@ -87,19 +123,21 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         
         let totalStartTime = CFAbsoluteTimeGetCurrent()
         
-        // Time renderer initialization
+        // Reuse existing renderer or create once
         let initStartTime = CFAbsoluteTimeGetCurrent()
-        let splat = try await SplatRenderer(device: device,
-                                            colorFormat: metalKitView.colorPixelFormat,
-                                            depthFormat: metalKitView.depthStencilPixelFormat,
-                                            sampleCount: metalKitView.sampleCount,
-                                            maxViewCount: 1,
-                                            maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+        if splatRenderer == nil {
+            splatRenderer = try await SplatRenderer(device: device,
+                                                    colorFormat: metalKitView.colorPixelFormat,
+                                                    depthFormat: metalKitView.depthStencilPixelFormat,
+                                                    sampleCount: metalKitView.sampleCount,
+                                                    maxViewCount: 1,
+                                                    maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+        }
         let initTime = (CFAbsoluteTimeGetCurrent() - initStartTime) * 1000
         
         // Time file reading/parsing
         let readStartTime = CFAbsoluteTimeGetCurrent()
-        try await splat.read(from: url)
+        try await splatRenderer?.load(from: url)
         let readTime = (CFAbsoluteTimeGetCurrent() - readStartTime) * 1000
         
         let totalTime = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000
@@ -108,16 +146,18 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
         let fileSizeMB = Double(fileSize) / (1024 * 1024)
         
-        modelRenderer = splat
+        modelRenderer = splatRenderer
         currentSequenceIndex = index
         
-        Self.log.info("""
+        let logMessage = """
             📊 Splat [\(index + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent)
                File: \(String(format: "%.2f", fileSizeMB)) MB
                Init: \(String(format: "%.1f", initTime)) ms
                Read: \(String(format: "%.1f", readTime)) ms
                Total: \(String(format: "%.1f", totalTime)) ms
-            """)
+            """
+        print(logMessage)
+        Self.log.info("\(logMessage)")
     }
 
     private func updateSequence() {
@@ -126,20 +166,171 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let now = Date()
         guard let lastChange = lastSequenceChangeTimestamp else {
             lastSequenceChangeTimestamp = now
+            // Start loading next frame immediately
+            loadNextFrameInBackground()
             return
         }
         
         if now.timeIntervalSince(lastChange) >= sequenceInterval {
             lastSequenceChangeTimestamp = now
             let nextIndex = (currentSequenceIndex + 1) % sequenceURLs.count
-            Task {
-                do {
-                    try await loadSequenceFrame(at: nextIndex)
-                } catch {
-                    Self.log.error("Failed to load sequence frame: \(error.localizedDescription)")
+            
+            // Check if we have all frames preloaded
+            if let preloaded = preloadedFrames[nextIndex] {
+                // Use preloaded frame from memory
+                let url = sequenceURLs[nextIndex]
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+                let fileSizeMB = Double(fileSize) / (1024 * 1024)
+                
+                // Swap renderers (don't reset old one since it's in the preloaded cache)
+                splatRenderer = preloaded
+                modelRenderer = preloaded
+                currentSequenceIndex = nextIndex
+                
+                let logMessage = """
+                    📊 Splat [\(nextIndex + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent) (preloaded)
+                       File: \(String(format: "%.2f", fileSizeMB)) MB
+                       Total: 0.0 ms
+                    """
+                print(logMessage)
+                Self.log.info("\(logMessage)")
+                
+                // Don't need to load next frame - it's already in memory!
+            } else if preloadAllFrames {
+                // Preload mode is on but frame isn't ready yet - skip this frame change
+                // Don't fall back to synchronous loading as it causes race conditions
+                return
+            } else if let preloaded = nextFrameRenderer {
+                // Fallback to single-frame preloading
+                let url = sequenceURLs[nextIndex]
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+                let fileSizeMB = Double(fileSize) / (1024 * 1024)
+                
+                // Swap renderers
+                let oldRenderer = splatRenderer
+                splatRenderer = preloaded
+                modelRenderer = preloaded
+                currentSequenceIndex = nextIndex
+                nextFrameRenderer = nil
+                loadingNextFrame = false
+                
+                // Log the swap - use print to ensure it shows up
+                let logMessage = """
+                    📊 Splat [\(nextIndex + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent) (preloaded)
+                       File: \(String(format: "%.2f", fileSizeMB)) MB
+                       Total: 0.0 ms
+                    """
+                print(logMessage)
+                Self.log.info("\(logMessage)")
+                
+                // Clean up old renderer and start loading next frame
+                oldRenderer?.reset()
+                loadNextFrameInBackground()
+            } else {
+                // Fallback to synchronous load
+                Task {
+                    do {
+                        try await loadSequenceFrame(at: nextIndex)
+                        loadNextFrameInBackground()
+                    } catch {
+                        Self.log.error("Failed to load sequence frame: \(error.localizedDescription)")
+                    }
                 }
             }
         }
+    }
+    
+    private func loadNextFrameInBackground() {
+        guard !loadingNextFrame else { return }
+        guard !sequenceURLs.isEmpty else { return }
+        
+        loadingNextFrame = true
+        let nextIndex = (currentSequenceIndex + 1) % sequenceURLs.count
+        let url = sequenceURLs[nextIndex]
+        
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            do {
+                // Create a new renderer for background loading to avoid conflicts with active rendering
+                let renderer = try await SplatRenderer(device: self.device,
+                                                      colorFormat: self.metalKitView.colorPixelFormat,
+                                                      depthFormat: self.metalKitView.depthStencilPixelFormat,
+                                                      sampleCount: self.metalKitView.sampleCount,
+                                                      maxViewCount: 1,
+                                                      maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+                
+                try await renderer.load(from: url)
+                
+                await MainActor.run {
+                    self.nextFrameRenderer = renderer
+                    self.loadingNextFrame = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.loadingNextFrame = false
+                    Self.log.error("Failed to preload next frame: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+    
+    private func preloadAllFrames() async {
+        guard !sequenceURLs.isEmpty else { return }
+        // Only preload if we haven't loaded all frames yet (frame 0 is already loaded)
+        guard preloadedFrames.count < sequenceURLs.count else { return }
+        
+        let totalFrames = sequenceURLs.count
+        preloadProgress = (0, totalFrames)
+        
+        Self.log.info("🔄 Preloading all \(totalFrames) frames into memory...")
+        print("🔄 Preloading all \(totalFrames) frames into memory...")
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        // Load all frames in parallel
+        await withTaskGroup(of: (Int, SplatRenderer?).self) { group in
+            for index in 0..<totalFrames {
+                // Skip index 0 since it's already loaded
+                guard index != 0 else { continue }
+                
+                group.addTask { [weak self] in
+                    guard let self = self else { return (index, nil) }
+                    do {
+                        let renderer = try await SplatRenderer(
+                            device: self.device,
+                            colorFormat: self.metalKitView.colorPixelFormat,
+                            depthFormat: self.metalKitView.depthStencilPixelFormat,
+                            sampleCount: self.metalKitView.sampleCount,
+                            maxViewCount: 1,
+                            maxSimultaneousRenders: Constants.maxSimultaneousRenders
+                        )
+                        try await renderer.load(from: self.sequenceURLs[index])
+                        
+                        await MainActor.run {
+                            self.preloadedFrames[index] = renderer
+                            self.preloadProgress.current += 1
+                            self.onPreloadProgress?(self.preloadProgress.current, self.preloadProgress.total)
+                        }
+                        
+                        return (index, renderer)
+                    } catch {
+                        Self.log.error("Failed to preload frame \(index): \(error.localizedDescription)")
+                        return (index, nil)
+                    }
+                }
+            }
+            
+            // Wait for all to complete
+            for await (index, renderer) in group {
+                if renderer != nil {
+                    // Already stored in the task
+                }
+            }
+        }
+        
+        let totalTime = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+        let loadedCount = preloadedFrames.count
+        Self.log.info("✅ Preloaded all \(loadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
+        print("✅ Preloaded all \(loadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
     }
 
     private var viewport: ModelRendererViewportDescriptor {
