@@ -3,10 +3,12 @@ import RealityKit
 import UniformTypeIdentifiers
 import CoreML
 import CoreImage
+import SplatIO
 
 struct ContentView: View {
     @State private var isPickingFile = false
     @State private var isPickingDirectory = false
+    @State private var isPickingDeltaSequence = false
     @State private var isPickingImage = false
     @State private var isProcessing = false
     @State private var sharpModel: MLModel?
@@ -276,6 +278,37 @@ end_header
                         openWindow(value: ModelIdentifier.gaussianSplatSequence(plyURLs))
                     } else {
                         modelLoadStatus = "❌ No PLY files found in directory"
+                    }
+                case .failure:
+                    break
+                }
+            }
+
+            Button("Read Delta-Encoded Sequence") {
+                isPickingDeltaSequence = true
+            }
+            .padding()
+            .buttonStyle(.borderedProminent)
+            .disabled(isPickingDeltaSequence)
+#if os(visionOS)
+            .disabled(immersiveSpaceIsShown)
+#endif
+            .fileImporter(isPresented: $isPickingDeltaSequence,
+                          allowedContentTypes: [.folder]) {
+                isPickingDeltaSequence = false
+                switch $0 {
+                case .success(let directoryURL):
+                    _ = directoryURL.startAccessingSecurityScopedResource()
+                    // Check if this is a valid delta sequence directory
+                    if DeltaSequenceDecoder.isValidDeltaSequenceDirectory(directoryURL) {
+                        Task {
+                            try await Task.sleep(for: .seconds(300))
+                            directoryURL.stopAccessingSecurityScopedResource()
+                        }
+                        openWindow(value: ModelIdentifier.deltaEncodedSequence(directoryURL))
+                    } else {
+                        modelLoadStatus = "❌ No delta sequence files found (need keyframe_*.ply.gz and deltas.npz)"
+                        directoryURL.stopAccessingSecurityScopedResource()
                     }
                 case .failure:
                     break

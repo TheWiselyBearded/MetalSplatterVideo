@@ -7,6 +7,7 @@ import os
 import SampleBoxRenderer
 import simd
 import Spatial
+import SplatIO
 import SwiftUI
 
 extension LayerRenderer.Clock.Instant.Duration {
@@ -53,6 +54,11 @@ class VisionSceneRenderer {
     private var preloadingAllTask: Task<Void, Never>?
     private var preloadProgress: (current: Int, total: Int) = (0, 0)
     var onPreloadProgress: ((Int, Int) -> Void)?  // Callback for progress updates
+    
+    // Delta sequence decoder
+    private var deltaDecoder: DeltaSequenceDecoder?
+    private var deltaFrameIndices: [Int] = []
+    private var currentDeltaFrameIndex: Int = 0
 
     init(_ layerRenderer: LayerRenderer) {
         self.layerRenderer = layerRenderer
@@ -80,6 +86,11 @@ class VisionSceneRenderer {
         preloadingAllTask?.cancel()
         preloadingAllTask = nil
         preloadProgress = (0, 0)
+        
+        // Clean up delta sequence
+        deltaDecoder = nil
+        deltaFrameIndices = []
+        currentDeltaFrameIndex = 0
         
         switch model {
         case .gaussianSplat(let url):
@@ -111,6 +122,33 @@ class VisionSceneRenderer {
                 // Original behavior: load first frame, then preload next
                 try await loadSequenceFrame(at: 0)
                 loadNextFrameInBackground()
+            }
+        case .deltaEncodedSequence(let directoryURL):
+            let decoder = DeltaSequenceDecoder(directoryURL: directoryURL)
+            try await decoder.load()
+            
+            deltaDecoder = decoder
+            deltaFrameIndices = decoder.frameIndices
+            currentDeltaFrameIndex = 0
+            lastSequenceChangeTimestamp = Date()
+            
+            Self.log.info("📦 Loaded delta sequence metadata: \(decoder.frameCount) frames")
+            print("📦 Loaded delta sequence metadata: \(decoder.frameCount) frames")
+            
+            if preloadAllFrames {
+                // Preload all decoded frames
+                try await loadDeltaFrame(at: 0)
+                // Add frame 0 to preloaded cache immediately
+                if let renderer = splatRenderer {
+                    preloadedFrames[0] = renderer
+                }
+                preloadingAllTask = Task { [weak self] in
+                    await self?.preloadAllDeltaFrames()
+                }
+            } else {
+                // Load first frame, then preload next
+                try await loadDeltaFrame(at: 0)
+                loadNextDeltaFrameInBackground()
             }
         case .sampleBox:
             modelRenderer = try! SampleBoxRenderer(device: device,
@@ -339,6 +377,235 @@ class VisionSceneRenderer {
         Self.log.info("✅ Preloaded all \(loadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
         print("✅ Preloaded all \(loadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
     }
+    
+    // MARK: - Delta Sequence Support
+    
+    private func loadDeltaFrame(at index: Int) async throws {
+        guard let decoder = deltaDecoder else { return }
+        guard index < deltaFrameIndices.count else { return }
+        
+        let frameIndex = deltaFrameIndices[index]
+        let totalStartTime = CFAbsoluteTimeGetCurrent()
+        
+        let decodeStartTime = CFAbsoluteTimeGetCurrent()
+        let points = try await decoder.getFrame(at: frameIndex)
+        let decodeTime = (CFAbsoluteTimeGetCurrent() - decodeStartTime) * 1000
+        
+        let initStartTime = CFAbsoluteTimeGetCurrent()
+        if splatRenderer == nil {
+            splatRenderer = try SplatRenderer(device: device,
+                                              colorFormat: layerRenderer.configuration.colorFormat,
+                                              depthFormat: layerRenderer.configuration.depthFormat,
+                                              sampleCount: 1,
+                                              maxViewCount: layerRenderer.properties.viewCount,
+                                              maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+        }
+        let initTime = (CFAbsoluteTimeGetCurrent() - initStartTime) * 1000
+        
+        let loadStartTime = CFAbsoluteTimeGetCurrent()
+        try splatRenderer?.load(points: points)
+        let loadTime = (CFAbsoluteTimeGetCurrent() - loadStartTime) * 1000
+        
+        modelRenderer = splatRenderer
+        currentDeltaFrameIndex = index
+        
+        let totalTime = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000
+        
+        // Estimate memory size (approximate: ~32 bytes per point for renderer buffers)
+        let estimatedSizeMB = Double(points.count * 32) / (1024 * 1024)
+        
+        let logMessage = """
+            📊 Delta Frame [\(index + 1)/\(deltaFrameIndices.count)] frame_\(frameIndex)
+               Points: \(points.count) (~\(String(format: "%.2f", estimatedSizeMB)) MB)
+               Decode: \(String(format: "%.1f", decodeTime)) ms
+               Init: \(String(format: "%.1f", initTime)) ms
+               Load: \(String(format: "%.1f", loadTime)) ms
+               Total: \(String(format: "%.1f", totalTime)) ms
+            """
+        print(logMessage)
+        Self.log.info("\(logMessage)")
+    }
+    
+    private func loadNextDeltaFrameInBackground() {
+        guard !loadingNextFrame else { return }
+        guard !deltaFrameIndices.isEmpty else { return }
+        guard let decoder = deltaDecoder else { return }
+        
+        loadingNextFrame = true
+        let nextIndex = (currentDeltaFrameIndex + 1) % deltaFrameIndices.count
+        let frameIndex = deltaFrameIndices[nextIndex]
+        
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            do {
+                let points = try await decoder.getFrame(at: frameIndex)
+                
+                let renderer = try SplatRenderer(device: self.device,
+                                                colorFormat: self.layerRenderer.configuration.colorFormat,
+                                                depthFormat: self.layerRenderer.configuration.depthFormat,
+                                                sampleCount: 1,
+                                                maxViewCount: self.layerRenderer.properties.viewCount,
+                                                maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+                
+                try renderer.load(points: points)
+                
+                await MainActor.run {
+                    self.nextFrameRenderer = renderer
+                    self.loadingNextFrame = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.loadingNextFrame = false
+                    Self.log.error("Failed to preload next delta frame: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+    
+    private func preloadAllDeltaFrames() async {
+        guard !deltaFrameIndices.isEmpty else { return }
+        guard let decoder = deltaDecoder else { return }
+        guard preloadedFrames.count < deltaFrameIndices.count else { return }
+        
+        let totalFrames = deltaFrameIndices.count
+        preloadProgress = (0, totalFrames)
+        
+        Self.log.info("🔄 Preloading all \(totalFrames) delta frames into memory...")
+        print("🔄 Preloading all \(totalFrames) delta frames into memory...")
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        var totalPoints = 0
+        var decodeTimes: [TimeInterval] = []
+        var loadTimes: [TimeInterval] = []
+        
+        await withTaskGroup(of: (Int, SplatRenderer?, Int, TimeInterval, TimeInterval).self) { group in
+            for index in 0..<totalFrames {
+                guard index != 0 else { continue }
+                
+                group.addTask { [weak self] in
+                    guard let self = self else { return (index, nil, 0, 0, 0) }
+                    do {
+                        let frameIndex = self.deltaFrameIndices[index]
+                        
+                        let decodeStart = CFAbsoluteTimeGetCurrent()
+                        let points = try await decoder.getFrame(at: frameIndex)
+                        let decodeTime = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000
+                        
+                        let loadStart = CFAbsoluteTimeGetCurrent()
+                        let renderer = try SplatRenderer(
+                            device: self.device,
+                            colorFormat: self.layerRenderer.configuration.colorFormat,
+                            depthFormat: self.layerRenderer.configuration.depthFormat,
+                            sampleCount: 1,
+                            maxViewCount: self.layerRenderer.properties.viewCount,
+                            maxSimultaneousRenders: Constants.maxSimultaneousRenders
+                        )
+                        try renderer.load(points: points)
+                        let loadTime = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
+                        
+                        await MainActor.run {
+                            self.preloadedFrames[index] = renderer
+                            self.preloadProgress.current += 1
+                            self.onPreloadProgress?(self.preloadProgress.current, self.preloadProgress.total)
+                        }
+                        
+                        return (index, renderer, points.count, decodeTime, loadTime)
+                    } catch {
+                        Self.log.error("Failed to preload delta frame \(index): \(error.localizedDescription)")
+                        return (index, nil, 0, 0, 0)
+                    }
+                }
+            }
+            
+            // Collect stats
+            for await (index, renderer, pointCount, decodeTime, loadTime) in group {
+                if renderer != nil {
+                    totalPoints += pointCount
+                    decodeTimes.append(decodeTime)
+                    loadTimes.append(loadTime)
+                }
+            }
+        }
+        
+        let totalTime = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+        let loadedCount = preloadedFrames.count
+        let avgDecodeTime = decodeTimes.isEmpty ? 0 : decodeTimes.reduce(0, +) / Double(decodeTimes.count)
+        let avgLoadTime = loadTimes.isEmpty ? 0 : loadTimes.reduce(0, +) / Double(loadTimes.count)
+        let estimatedSizeMB = Double(totalPoints * 32) / (1024 * 1024)
+        
+        Self.log.info("✅ Preloaded all \(loadedCount)/\(totalFrames) delta frames in \(String(format: "%.1f", totalTime)) ms")
+        print("✅ Preloaded all \(loadedCount)/\(totalFrames) delta frames in \(String(format: "%.1f", totalTime)) ms")
+        print("   Total points: \(totalPoints) (~\(String(format: "%.2f", estimatedSizeMB)) MB)")
+        print("   Avg decode: \(String(format: "%.1f", avgDecodeTime)) ms, Avg load: \(String(format: "%.1f", avgLoadTime)) ms")
+    }
+    
+    private func updateDeltaSequence() {
+        guard !deltaFrameIndices.isEmpty else { return }
+        
+        let now = Date()
+        guard let lastChange = lastSequenceChangeTimestamp else {
+            lastSequenceChangeTimestamp = now
+            loadNextDeltaFrameInBackground()
+            return
+        }
+        
+        if now.timeIntervalSince(lastChange) >= sequenceInterval {
+            lastSequenceChangeTimestamp = now
+            let nextIndex = (currentDeltaFrameIndex + 1) % deltaFrameIndices.count
+            
+            if let preloaded = preloadedFrames[nextIndex] {
+                let frameIndex = deltaFrameIndices[nextIndex]
+                let pointCount = preloaded.splatCount
+                let estimatedSizeMB = Double(pointCount * 32) / (1024 * 1024)
+                
+                splatRenderer = preloaded
+                modelRenderer = preloaded
+                currentDeltaFrameIndex = nextIndex
+                
+                let logMessage = """
+                    📊 Delta Frame [\(nextIndex + 1)/\(deltaFrameIndices.count)] frame_\(frameIndex) (preloaded)
+                       Points: \(pointCount) (~\(String(format: "%.2f", estimatedSizeMB)) MB)
+                       Total: 0.0 ms
+                    """
+                print(logMessage)
+                Self.log.info("\(logMessage)")
+                
+            } else if preloadAllFrames {
+                return
+            } else if let preloaded = nextFrameRenderer {
+                let frameIndex = deltaFrameIndices[nextIndex]
+                let pointCount = preloaded.splatCount
+                let estimatedSizeMB = Double(pointCount * 32) / (1024 * 1024)
+                
+                let oldRenderer = splatRenderer
+                splatRenderer = preloaded
+                modelRenderer = preloaded
+                currentDeltaFrameIndex = nextIndex
+                nextFrameRenderer = nil
+                loadingNextFrame = false
+                
+                let logMessage = """
+                    📊 Delta Frame [\(nextIndex + 1)/\(deltaFrameIndices.count)] frame_\(frameIndex) (preloaded)
+                       Points: \(pointCount) (~\(String(format: "%.2f", estimatedSizeMB)) MB)
+                       Total: 0.0 ms
+                    """
+                print(logMessage)
+                Self.log.info("\(logMessage)")
+                
+                oldRenderer?.reset()
+                loadNextDeltaFrameInBackground()
+            } else {
+                Task {
+                    do {
+                        try await loadDeltaFrame(at: nextIndex)
+                        loadNextDeltaFrameInBackground()
+                    } catch {
+                        Self.log.error("Failed to load delta frame: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
 
     func startRenderLoop() {
         Task {
@@ -396,6 +663,9 @@ class VisionSceneRenderer {
     func renderFrame() {
         // Update sequence if we're playing a sequence
         updateSequence()
+        
+        // Update delta sequence if we're playing a delta-encoded sequence
+        updateDeltaSequence()
         
         guard let frame = layerRenderer.queryNextFrame() else { return }
 
