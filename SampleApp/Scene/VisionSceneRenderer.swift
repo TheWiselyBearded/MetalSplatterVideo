@@ -59,6 +59,10 @@ class VisionSceneRenderer {
     private var deltaDecoder: DeltaSequenceDecoder?
     private var deltaFrameIndices: [Int] = []
     private var currentDeltaFrameIndex: Int = 0
+    
+    // GPU timing tracking
+    private var gpuFrameCount: Int = 0
+    private var totalGPUTime: TimeInterval = 0
 
     init(_ layerRenderer: LayerRenderer) {
         self.layerRenderer = layerRenderer
@@ -235,7 +239,7 @@ class VisionSceneRenderer {
                 let logMessage = """
                     📊 Splat [\(nextIndex + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent) (preloaded)
                        File: \(String(format: "%.2f", fileSizeMB)) MB
-                       Total: 0.0 ms
+                       Swap: 0.0 ms (GPU render time measured separately)
                     """
                 print(logMessage)
                 Self.log.info("\(logMessage)")
@@ -263,7 +267,7 @@ class VisionSceneRenderer {
                 let logMessage = """
                     📊 Splat [\(nextIndex + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent) (preloaded)
                        File: \(String(format: "%.2f", fileSizeMB)) MB
-                       Total: 0.0 ms
+                       Swap: 0.0 ms (GPU render time measured separately)
                     """
                 print(logMessage)
                 Self.log.info("\(logMessage)")
@@ -565,7 +569,7 @@ class VisionSceneRenderer {
                 let logMessage = """
                     📊 Delta Frame [\(nextIndex + 1)/\(deltaFrameIndices.count)] frame_\(frameIndex) (preloaded)
                        Points: \(pointCount) (~\(String(format: "%.2f", estimatedSizeMB)) MB)
-                       Total: 0.0 ms
+                       Swap: 0.0 ms (GPU render time measured separately)
                     """
                 print(logMessage)
                 Self.log.info("\(logMessage)")
@@ -587,7 +591,7 @@ class VisionSceneRenderer {
                 let logMessage = """
                     📊 Delta Frame [\(nextIndex + 1)/\(deltaFrameIndices.count)] frame_\(frameIndex) (preloaded)
                        Points: \(pointCount) (~\(String(format: "%.2f", estimatedSizeMB)) MB)
-                       Total: 0.0 ms
+                       Swap: 0.0 ms (GPU render time measured separately)
                     """
                 print(logMessage)
                 Self.log.info("\(logMessage)")
@@ -690,8 +694,30 @@ class VisionSceneRenderer {
 
         drawable.deviceAnchor = deviceAnchor
 
+        // Measure GPU rendering time
+        let renderStartTime = CFAbsoluteTimeGetCurrent()
+
         let semaphore = inFlightSemaphore
-        commandBuffer.addCompletedHandler { (_ commandBuffer)-> Swift.Void in
+        commandBuffer.addCompletedHandler { [weak self] (_ commandBuffer)-> Swift.Void in
+            guard let self = self else {
+                semaphore.signal()
+                return
+            }
+            let gpuTime = (CFAbsoluteTimeGetCurrent() - renderStartTime) * 1000
+            self.totalGPUTime += gpuTime
+            self.gpuFrameCount += 1
+            
+            // Log GPU time periodically (every 30 frames) or if it's unusually high
+            if self.gpuFrameCount % 30 == 0 || gpuTime > 16.67 { // 16.67ms = 60fps threshold
+                let avgGPUTime = self.totalGPUTime / Double(self.gpuFrameCount)
+                Self.log.debug("GPU render: \(String(format: "%.2f", gpuTime)) ms (avg: \(String(format: "%.2f", avgGPUTime)) ms)")
+                if gpuTime > 16.67 {
+                    print("⚠️ High GPU render time: \(String(format: "%.2f", gpuTime)) ms")
+                }
+                self.totalGPUTime = 0
+                self.gpuFrameCount = 0
+            }
+            
             semaphore.signal()
         }
 

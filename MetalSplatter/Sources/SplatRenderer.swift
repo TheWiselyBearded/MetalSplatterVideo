@@ -165,6 +165,9 @@ public class SplatRenderer {
     // cameraWorldPosition and Forward vectors are the latest mean camera position across all viewports
     var cameraWorldPosition: SIMD3<Float> = .zero
     var cameraWorldForward: SIMD3<Float> = .init(x: 0, y: 0, z: -1)
+    
+    // Track if renderer has been sorted at least once (for preloaded renderers)
+    private var hasBeenSorted: Bool = false
 
     typealias IndexType = UInt32
     // splatBuffer contains one entry for each gaussian splat
@@ -232,6 +235,7 @@ public class SplatRenderer {
         try? splatBuffer.setCapacity(0)
         try? splatBufferPrime.setCapacity(0)
         orderAndDepthTempSort.removeAll()
+        hasBeenSorted = false
     }
 
     public func read(from url: URL) async throws {
@@ -250,6 +254,14 @@ public class SplatRenderer {
     public func load(points: [SplatScenePoint]) throws {
         reset()
         try add(points)
+        // Trigger initial sort with default camera position so renderer is ready
+        // This ensures preloaded renderers are sorted before first use
+        if !sorting && splatBuffer.count > 0 {
+            // Use a default camera position for initial sort
+            cameraWorldPosition = .zero
+            cameraWorldForward = .init(x: 0, y: 0, z: -1)
+            resort()
+        }
     }
 
     private func resetPipelineStates() {
@@ -424,11 +436,20 @@ public class SplatRenderer {
             self.uniforms.pointee.setUniforms(index: i, uniforms)
         }
 
-        cameraWorldPosition = viewports.map { Self.cameraWorldPosition(forViewMatrix: $0.viewMatrix) }.mean ?? .zero
-        cameraWorldForward = viewports.map { Self.cameraWorldForward(forViewMatrix: $0.viewMatrix) }.mean?.normalized ?? .init(x: 0, y: 0, z: -1)
+        let newCameraWorldPosition = viewports.map { Self.cameraWorldPosition(forViewMatrix: $0.viewMatrix) }.mean ?? .zero
+        let newCameraWorldForward = viewports.map { Self.cameraWorldForward(forViewMatrix: $0.viewMatrix) }.mean?.normalized ?? .init(x: 0, y: 0, z: -1)
+        
+        // Only resort if camera has moved significantly or if we haven't sorted yet
+        let positionMoved = (newCameraWorldPosition - cameraWorldPosition).lengthSquared > 0.01
+        let forwardChanged = (newCameraWorldForward - cameraWorldForward).lengthSquared > 0.01
+        let cameraMoved = !hasBeenSorted || positionMoved || forwardChanged
+        
+        cameraWorldPosition = newCameraWorldPosition
+        cameraWorldForward = newCameraWorldForward
 
-        if !sorting {
+        if !sorting && cameraMoved {
             resort()
+            hasBeenSorted = true
         }
     }
 

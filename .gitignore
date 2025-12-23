@@ -3,6 +3,12 @@ xcuserdata
 DerivedData/
 .swiftpm
 
+# Swift build artifacts
+.build/
+*.swiftdeps
+*.swift.o
+*.d
+*.dia
 
 # Ignore Core ML model packages
 SampleApp/Models/**/*.mlpackage/
