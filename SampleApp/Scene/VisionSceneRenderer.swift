@@ -36,6 +36,23 @@ class VisionSceneRenderer {
 
     let arSession: ARKitSession
     let worldTracking: WorldTrackingProvider
+    
+    // Splat transform properties (read from UserDefaults to sync with ContentView)
+    private var splatScale: Float {
+        Float(UserDefaults.standard.double(forKey: "splatScale"))
+    }
+    
+    private var splatPositionX: Float {
+        Float(UserDefaults.standard.double(forKey: "splatPositionX"))
+    }
+    
+    private var splatPositionY: Float {
+        Float(UserDefaults.standard.double(forKey: "splatPositionY"))
+    }
+    
+    private var splatPositionZ: Float {
+        Float(UserDefaults.standard.double(forKey: "splatPositionZ"))
+    }
 
     // Sequence playback properties
     var sequenceURLs: [URL] = []
@@ -630,7 +647,12 @@ class VisionSceneRenderer {
     private func viewports(drawable: LayerRenderer.Drawable, deviceAnchor: DeviceAnchor?) -> [ModelRendererViewportDescriptor] {
             let rotationMatrix = matrix4x4_rotation(radians: Float(rotation.radians),
                                                     axis: Constants.rotationAxis)
-            let translationMatrix = matrix4x4_translation(0.0, 0.0, Constants.modelCenterZ)
+            
+            // Apply scale transform
+            let scaleMatrix = matrix4x4_scale(splatScale, splatScale, splatScale)
+            
+            // Apply position transform (use user-controlled position)
+            let translationMatrix = matrix4x4_translation(splatPositionX, splatPositionY, splatPositionZ)
             
             let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
 
@@ -647,9 +669,12 @@ class VisionSceneRenderer {
                 let screenSize = SIMD2(x: Int(view.textureMap.viewport.width),
                                        y: Int(view.textureMap.viewport.height))
                 
+                // Apply transforms in order: translation -> rotation -> scale -> calibration
+                // Matrix multiplication applies right-to-left, so: calibration -> scale -> rotation -> translation
+                // This means the model is first scaled (around origin), then rotated, then translated
                 return ModelRendererViewportDescriptor(viewport: view.textureMap.viewport,
                                                        projectionMatrix: .init(projectionMatrix),
-                                                       viewMatrix: userViewpointMatrix * translationMatrix * rotationMatrix * commonUpCalibration,
+                                                       viewMatrix: userViewpointMatrix * translationMatrix * rotationMatrix * scaleMatrix * commonUpCalibration,
                                                        screenSize: screenSize)
             }
         }

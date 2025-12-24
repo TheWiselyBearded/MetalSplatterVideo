@@ -14,6 +14,12 @@ struct ContentView: View {
     @State private var sharpModel: MLModel?
     @State private var modelLoadStatus: String?
     @AppStorage("preloadAllFrames") private var preloadAllFrames = false
+    
+    // Splat transform controls
+    @AppStorage("splatScale") private var splatScale: Double = 1.0
+    @AppStorage("splatPositionX") private var splatPositionX: Double = 0.0
+    @AppStorage("splatPositionY") private var splatPositionY: Double = 0.0
+    @AppStorage("splatPositionZ") private var splatPositionZ: Double = -8.0
 
 #if os(macOS)
     @Environment(\.openWindow) private var openWindow
@@ -251,6 +257,48 @@ end_header
             Toggle("Preload all frames into memory", isOn: $preloadAllFrames)
                 .padding(.horizontal)
                 .help("Load all frames at once for smoother playback (uses more memory)")
+            
+#if os(visionOS)
+            if immersiveSpaceIsShown {
+                VStack(spacing: 12) {
+                    Text("Splat Controls")
+                        .font(.headline)
+                        .padding(.top)
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Scale: \(splatScale, specifier: "%.2f")")
+                            .font(.caption)
+                        Slider(value: $splatScale, in: 0.1...5.0, step: 0.1)
+                    }
+                    .padding(.horizontal)
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Position X: \(splatPositionX, specifier: "%.2f")")
+                            .font(.caption)
+                        Slider(value: $splatPositionX, in: -10.0...10.0, step: 0.1)
+                    }
+                    .padding(.horizontal)
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Position Y: \(splatPositionY, specifier: "%.2f")")
+                            .font(.caption)
+                        Slider(value: $splatPositionY, in: -10.0...10.0, step: 0.1)
+                    }
+                    .padding(.horizontal)
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Position Z: \(splatPositionZ, specifier: "%.2f")")
+                            .font(.caption)
+                        Slider(value: $splatPositionZ, in: -20.0...5.0, step: 0.1)
+                    }
+                    .padding(.horizontal)
+                }
+                .padding()
+                .background(Color.black.opacity(0.3))
+                .cornerRadius(12)
+                .padding(.horizontal)
+            }
+#endif
             
             Button("Read PLY Directory (Sequence)") {
                 isPickingDirectory = true
