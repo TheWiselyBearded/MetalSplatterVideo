@@ -67,7 +67,7 @@ class VisionSceneRenderer {
     
     // Preload-all frames option
     var preloadAllFrames: Bool = false
-    private var preloadedFrames: [Int: SplatRenderer] = [:]
+    private var preloadedFrames: [SplatRenderer?] = []  // Array indexed by frame number for faster lookups
     private var preloadingAllTask: Task<Void, Never>?
     private var preloadProgress: (current: Int, total: Int) = (0, 0)
     var onPreloadProgress: ((Int, Int) -> Void)?  // Callback for progress updates
@@ -130,6 +130,8 @@ class VisionSceneRenderer {
             lastSequenceChangeTimestamp = Date()
             
             if preloadAllFrames {
+                // Initialize array to hold all frames
+                preloadedFrames = Array(repeating: nil, count: urls.count)
                 // Load first frame synchronously, then preload all others
                 try await loadSequenceFrame(at: 0)
                 // Add frame 0 to preloaded cache immediately
@@ -157,6 +159,8 @@ class VisionSceneRenderer {
             print("📦 Loaded delta sequence metadata: \(decoder.frameCount) frames")
             
             if preloadAllFrames {
+                // Initialize array to hold all frames
+                preloadedFrames = Array(repeating: nil, count: deltaFrameIndices.count)
                 // Preload all decoded frames
                 try await loadDeltaFrame(at: 0)
                 // Add frame 0 to preloaded cache immediately
@@ -242,7 +246,7 @@ class VisionSceneRenderer {
             let nextIndex = (currentSequenceIndex + 1) % sequenceURLs.count
             
             // Check if we have all frames preloaded
-            if let preloaded = preloadedFrames[nextIndex] {
+            if nextIndex < preloadedFrames.count, let preloaded = preloadedFrames[nextIndex] {
                 // Use preloaded frame from memory
                 let url = sequenceURLs[nextIndex]
                 let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
@@ -260,6 +264,9 @@ class VisionSceneRenderer {
                     """
                 print(logMessage)
                 Self.log.info("\(logMessage)")
+                
+                // Batch sort upcoming frames in background for smoother playback
+                batchSortUpcomingFrames()
                 
                 // Don't need to load next frame - it's already in memory!
             } else if preloadAllFrames {
@@ -343,7 +350,8 @@ class VisionSceneRenderer {
     private func preloadAllFrames() async {
         guard !sequenceURLs.isEmpty else { return }
         // Only preload if we haven't loaded all frames yet (frame 0 is already loaded)
-        guard preloadedFrames.count < sequenceURLs.count else { return }
+        let loadedCount = preloadedFrames.compactMap { $0 }.count
+        guard loadedCount < sequenceURLs.count else { return }
         
         let totalFrames = sequenceURLs.count
         preloadProgress = (0, totalFrames)
@@ -394,9 +402,183 @@ class VisionSceneRenderer {
         }
         
         let totalTime = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let loadedCount = preloadedFrames.count
-        Self.log.info("✅ Preloaded all \(loadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
-        print("✅ Preloaded all \(loadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
+        let finalLoadedCount = preloadedFrames.compactMap { $0 }.count
+        Self.log.info("✅ Preloaded all \(finalLoadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
+        print("✅ Preloaded all \(finalLoadedCount)/\(totalFrames) frames in \(String(format: "%.1f", totalTime)) ms")
+        
+        // Pre-sort all frames with initial camera position for smooth playback
+        await preSortAllFrames()
+    }
+    
+    private func preSortAllFrames() async {
+        guard !preloadedFrames.isEmpty else { return }
+        
+        // Calculate initial camera position from default viewport
+        // For Vision Pro, we use a default viewport since we don't have drawable during preload
+        let rotationMatrix = matrix4x4_rotation(radians: Float(rotation.radians),
+                                                axis: Constants.rotationAxis)
+        let scaleMatrix = matrix4x4_scale(Float(splatScale), Float(splatScale), Float(splatScale))
+        let translationMatrix = matrix4x4_translation(Float(splatPositionX), Float(splatPositionY), Float(splatPositionZ))
+        let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
+        
+        // Use identity for device anchor (default position)
+        let defaultViewMatrix = translationMatrix * rotationMatrix * scaleMatrix * commonUpCalibration
+        
+        let initialCameraPosition = SplatRenderer.cameraWorldPosition(forViewMatrix: defaultViewMatrix)
+        let initialCameraForward = SplatRenderer.cameraWorldForward(forViewMatrix: defaultViewMatrix)
+        
+        let frameCount = preloadedFrames.compactMap { $0 }.count
+        Self.log.info("🔄 Pre-sorting all \(frameCount) frames with initial camera position...")
+        print("🔄 Pre-sorting all \(frameCount) frames with initial camera position...")
+        let sortStartTime = CFAbsoluteTimeGetCurrent()
+        
+        // Update camera position and trigger sort for all preloaded frames in parallel
+        await withTaskGroup(of: Void.self) { group in
+            for (index, renderer) in preloadedFrames.enumerated() {
+                guard let renderer = renderer else { continue }
+                group.addTask {
+                    // Update camera position to match initial viewport
+                    renderer.cameraWorldPosition = initialCameraPosition
+                    renderer.cameraWorldForward = initialCameraForward
+                    // Trigger sort
+                    renderer.resort()
+                    // Wait for sort to complete
+                    await renderer.waitForSortToComplete()
+                }
+            }
+        }
+        
+        let sortTime = (CFAbsoluteTimeGetCurrent() - sortStartTime) * 1000
+        Self.log.info("✅ Pre-sorted all frames in \(String(format: "%.1f", sortTime)) ms")
+        print("✅ Pre-sorted all frames in \(String(format: "%.1f", sortTime)) ms")
+    }
+    
+    /// Batch sort frames in the sequence with current camera position for smoother playback
+    /// When camera moves, re-sorts current frame and upcoming frames
+    private func batchSortUpcomingFrames() {
+        guard preloadAllFrames else { return }
+        guard !sequenceURLs.isEmpty else { return }
+        
+        // Get current camera position from default viewport (Vision Pro uses dynamic viewports)
+        let rotationMatrix = matrix4x4_rotation(radians: Float(rotation.radians),
+                                                axis: Constants.rotationAxis)
+        let scaleMatrix = matrix4x4_scale(Float(splatScale), Float(splatScale), Float(splatScale))
+        let translationMatrix = matrix4x4_translation(Float(splatPositionX), Float(splatPositionY), Float(splatPositionZ))
+        let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
+        let defaultViewMatrix = translationMatrix * rotationMatrix * scaleMatrix * commonUpCalibration
+        
+        let currentCameraPosition = SplatRenderer.cameraWorldPosition(forViewMatrix: defaultViewMatrix)
+        let currentCameraForward = SplatRenderer.cameraWorldForward(forViewMatrix: defaultViewMatrix)
+        
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            
+            // First, check and sort the current frame if camera has moved
+            let currentIndex = self.currentSequenceIndex
+            if currentIndex < self.preloadedFrames.count,
+               let currentRenderer = self.preloadedFrames[currentIndex] {
+                let positionMoved = (currentRenderer.cameraWorldPosition - currentCameraPosition).lengthSquared > 0.01
+                let forwardChanged = (currentRenderer.cameraWorldForward - currentCameraForward).lengthSquared > 0.01
+                
+                if positionMoved || forwardChanged {
+                    currentRenderer.cameraWorldPosition = currentCameraPosition
+                    currentRenderer.cameraWorldForward = currentCameraForward
+                    if !currentRenderer.sorting {
+                        currentRenderer.resort()
+                    }
+                }
+            }
+            
+            // Then sort next 10 frames (increased from 5 for better coverage)
+            let framesToSort = 10
+            for offset in 1...framesToSort {
+                let index = (currentIndex + offset) % self.sequenceURLs.count
+                
+                // Check bounds and if frame exists
+                guard index < self.preloadedFrames.count,
+                      let renderer = self.preloadedFrames[index] else { continue }
+                
+                // Check if camera has moved significantly
+                let positionMoved = (renderer.cameraWorldPosition - currentCameraPosition).lengthSquared > 0.01
+                let forwardChanged = (renderer.cameraWorldForward - currentCameraForward).lengthSquared > 0.01
+                
+                // Only sort if camera has moved significantly or renderer hasn't been sorted yet
+                if positionMoved || forwardChanged || !renderer.hasBeenSorted {
+                    // Update camera position
+                    renderer.cameraWorldPosition = currentCameraPosition
+                    renderer.cameraWorldForward = currentCameraForward
+                    
+                    // Trigger sort if not already sorting
+                    if !renderer.sorting {
+                        renderer.resort()
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Batch sort delta frames in the sequence with current camera position
+    /// When camera moves, re-sorts current frame and upcoming frames
+    private func batchSortUpcomingDeltaFrames() {
+        guard preloadAllFrames else { return }
+        guard !deltaFrameIndices.isEmpty else { return }
+        
+        // Get current camera position from default viewport
+        let rotationMatrix = matrix4x4_rotation(radians: Float(rotation.radians),
+                                                axis: Constants.rotationAxis)
+        let scaleMatrix = matrix4x4_scale(Float(splatScale), Float(splatScale), Float(splatScale))
+        let translationMatrix = matrix4x4_translation(Float(splatPositionX), Float(splatPositionY), Float(splatPositionZ))
+        let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
+        let defaultViewMatrix = translationMatrix * rotationMatrix * scaleMatrix * commonUpCalibration
+        
+        let currentCameraPosition = SplatRenderer.cameraWorldPosition(forViewMatrix: defaultViewMatrix)
+        let currentCameraForward = SplatRenderer.cameraWorldForward(forViewMatrix: defaultViewMatrix)
+        
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            
+            // First, check and sort the current frame if camera has moved
+            let currentIndex = self.currentDeltaFrameIndex
+            if currentIndex < self.preloadedFrames.count,
+               let currentRenderer = self.preloadedFrames[currentIndex] {
+                let positionMoved = (currentRenderer.cameraWorldPosition - currentCameraPosition).lengthSquared > 0.01
+                let forwardChanged = (currentRenderer.cameraWorldForward - currentCameraForward).lengthSquared > 0.01
+                
+                if positionMoved || forwardChanged {
+                    currentRenderer.cameraWorldPosition = currentCameraPosition
+                    currentRenderer.cameraWorldForward = currentCameraForward
+                    if !currentRenderer.sorting {
+                        currentRenderer.resort()
+                    }
+                }
+            }
+            
+            // Then sort next 10 frames (increased from 5 for better coverage)
+            let framesToSort = 10
+            for offset in 1...framesToSort {
+                let index = (currentIndex + offset) % self.deltaFrameIndices.count
+                
+                // Check bounds and if frame exists
+                guard index < self.preloadedFrames.count,
+                      let renderer = self.preloadedFrames[index] else { continue }
+                
+                // Check if camera has moved significantly
+                let positionMoved = (renderer.cameraWorldPosition - currentCameraPosition).lengthSquared > 0.01
+                let forwardChanged = (renderer.cameraWorldForward - currentCameraForward).lengthSquared > 0.01
+                
+                // Only sort if camera has moved significantly or renderer hasn't been sorted yet
+                if positionMoved || forwardChanged || !renderer.hasBeenSorted {
+                    // Update camera position
+                    renderer.cameraWorldPosition = currentCameraPosition
+                    renderer.cameraWorldForward = currentCameraForward
+                    
+                    // Trigger sort if not already sorting
+                    if !renderer.sorting {
+                        renderer.resort()
+                    }
+                }
+            }
+        }
     }
     
     // MARK: - Delta Sequence Support
@@ -486,7 +668,8 @@ class VisionSceneRenderer {
     private func preloadAllDeltaFrames() async {
         guard !deltaFrameIndices.isEmpty else { return }
         guard let decoder = deltaDecoder else { return }
-        guard preloadedFrames.count < deltaFrameIndices.count else { return }
+        let loadedCount = preloadedFrames.compactMap { $0 }.count
+        guard loadedCount < deltaFrameIndices.count else { return }
         
         let totalFrames = deltaFrameIndices.count
         preloadProgress = (0, totalFrames)
@@ -549,15 +732,18 @@ class VisionSceneRenderer {
         }
         
         let totalTime = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let loadedCount = preloadedFrames.count
+        let finalLoadedCount = preloadedFrames.compactMap { $0 }.count
         let avgDecodeTime = decodeTimes.isEmpty ? 0 : decodeTimes.reduce(0, +) / Double(decodeTimes.count)
         let avgLoadTime = loadTimes.isEmpty ? 0 : loadTimes.reduce(0, +) / Double(loadTimes.count)
         let estimatedSizeMB = Double(totalPoints * 32) / (1024 * 1024)
         
-        Self.log.info("✅ Preloaded all \(loadedCount)/\(totalFrames) delta frames in \(String(format: "%.1f", totalTime)) ms")
+        Self.log.info("✅ Preloaded all \(finalLoadedCount)/\(totalFrames) delta frames in \(String(format: "%.1f", totalTime)) ms")
         print("✅ Preloaded all \(loadedCount)/\(totalFrames) delta frames in \(String(format: "%.1f", totalTime)) ms")
         print("   Total points: \(totalPoints) (~\(String(format: "%.2f", estimatedSizeMB)) MB)")
         print("   Avg decode: \(String(format: "%.1f", avgDecodeTime)) ms, Avg load: \(String(format: "%.1f", avgLoadTime)) ms")
+        
+        // Pre-sort all delta frames with initial camera position for smooth playback
+        await preSortAllFrames()
     }
     
     private func updateDeltaSequence() {
@@ -590,6 +776,9 @@ class VisionSceneRenderer {
                     """
                 print(logMessage)
                 Self.log.info("\(logMessage)")
+                
+                // Batch sort upcoming frames in background for smoother playback
+                batchSortUpcomingDeltaFrames()
                 
             } else if preloadAllFrames {
                 return

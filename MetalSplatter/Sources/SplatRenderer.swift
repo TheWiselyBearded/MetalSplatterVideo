@@ -163,11 +163,11 @@ public class SplatRenderer {
     var uniforms: UnsafeMutablePointer<UniformsArray>
 
     // cameraWorldPosition and Forward vectors are the latest mean camera position across all viewports
-    var cameraWorldPosition: SIMD3<Float> = .zero
-    var cameraWorldForward: SIMD3<Float> = .init(x: 0, y: 0, z: -1)
+    public var cameraWorldPosition: SIMD3<Float> = .zero
+    public var cameraWorldForward: SIMD3<Float> = .init(x: 0, y: 0, z: -1)
     
     // Track if renderer has been sorted at least once (for preloaded renderers)
-    private var hasBeenSorted: Bool = false
+    public var hasBeenSorted: Bool = false
 
     typealias IndexType = UInt32
     // splatBuffer contains one entry for each gaussian splat
@@ -183,9 +183,16 @@ public class SplatRenderer {
 
     public var splatCount: Int { splatBuffer.count }
 
-    var sorting = false
+    public var sorting = false
     var sortCancelled = false
     var orderAndDepthTempSort: [SplatIndexAndDepth] = []
+    
+    /// Wait for any ongoing sort operation to complete. Useful for pre-sorting frames.
+    public func waitForSortToComplete() async {
+        while sorting {
+            try? await Task.sleep(nanoseconds: 1_000_000) // 1ms
+        }
+    }
 
     public init(device: MTLDevice,
                 colorFormat: MTLPixelFormat,
@@ -453,11 +460,11 @@ public class SplatRenderer {
         }
     }
 
-    private static func cameraWorldForward(forViewMatrix view: simd_float4x4) -> simd_float3 {
+    public static func cameraWorldForward(forViewMatrix view: simd_float4x4) -> simd_float3 {
         (view.inverse * SIMD4<Float>(x: 0, y: 0, z: -1, w: 0)).xyz
     }
 
-    private static func cameraWorldPosition(forViewMatrix view: simd_float4x4) -> simd_float3 {
+    public static func cameraWorldPosition(forViewMatrix view: simd_float4x4) -> simd_float3 {
         (view.inverse * SIMD4<Float>(x: 0, y: 0, z: 0, w: 1)).xyz
     }
 
@@ -726,12 +733,12 @@ private extension MTLPackedFloat3 {
     }
 }
 
-private extension SIMD3 where Scalar: BinaryFloatingPoint, Scalar.RawSignificand: FixedWidthInteger {
+extension SIMD3 where Scalar: BinaryFloatingPoint, Scalar.RawSignificand: FixedWidthInteger {
     var normalized: SIMD3<Scalar> {
         self / Scalar(sqrt(lengthSquared))
     }
 
-    var lengthSquared: Scalar {
+    public var lengthSquared: Scalar {
         x*x + y*y + z*z
     }
 
