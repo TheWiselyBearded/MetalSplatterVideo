@@ -260,42 +260,49 @@ end_header
             
 #if os(visionOS)
             if immersiveSpaceIsShown {
-                VStack(spacing: 12) {
-                    Text("Splat Controls")
-                        .font(.headline)
-                        .padding(.top)
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Scale: \(splatScale, specifier: "%.2f")")
-                            .font(.caption)
-                        Slider(value: $splatScale, in: 0.1...5.0, step: 0.1)
+                VStack(spacing: 16) {
+                    // Video player controls (only show if sequence is loaded)
+                    if UserDefaults.standard.integer(forKey: "totalFrames") > 1 {
+                        VideoPlayerControls { frameIndex in
+                            UserDefaults.standard.set(frameIndex, forKey: "currentFrameIndex")
+                        }
                     }
-                    .padding(.horizontal)
                     
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Position X: \(splatPositionX, specifier: "%.2f")")
-                            .font(.caption)
-                        Slider(value: $splatPositionX, in: -10.0...10.0, step: 0.1)
+                    // Splat transform controls
+                    VStack(spacing: 12) {
+                        Text("Transform")
+                            .font(.headline)
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Scale: \(splatScale, specifier: "%.2f")")
+                                .font(.caption)
+                            Slider(value: $splatScale, in: 0.1...5.0, step: 0.1)
+                        }
+                        
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("X: \(splatPositionX, specifier: "%.1f")")
+                                    .font(.caption)
+                                Slider(value: $splatPositionX, in: -10.0...10.0, step: 0.1)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Y: \(splatPositionY, specifier: "%.1f")")
+                                    .font(.caption)
+                                Slider(value: $splatPositionY, in: -10.0...10.0, step: 0.1)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Z: \(splatPositionZ, specifier: "%.1f")")
+                                    .font(.caption)
+                                Slider(value: $splatPositionZ, in: -20.0...5.0, step: 0.1)
+                            }
+                        }
                     }
-                    .padding(.horizontal)
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Position Y: \(splatPositionY, specifier: "%.2f")")
-                            .font(.caption)
-                        Slider(value: $splatPositionY, in: -10.0...10.0, step: 0.1)
-                    }
-                    .padding(.horizontal)
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Position Z: \(splatPositionZ, specifier: "%.2f")")
-                            .font(.caption)
-                        Slider(value: $splatPositionZ, in: -20.0...5.0, step: 0.1)
-                    }
-                    .padding(.horizontal)
+                    .padding()
+                    .background(Color.black.opacity(0.3))
+                    .cornerRadius(12)
                 }
-                .padding()
-                .background(Color.black.opacity(0.3))
-                .cornerRadius(12)
                 .padding(.horizontal)
             }
 #endif

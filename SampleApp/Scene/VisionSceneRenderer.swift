@@ -60,6 +60,30 @@ class VisionSceneRenderer {
     var lastSequenceChangeTimestamp: Date? = nil
     var sequenceInterval: TimeInterval = 1.0 / 30.0  // 30 FPS
     
+    // Playback control properties (synced with UserDefaults)
+    private var isPlaying: Bool {
+        get { UserDefaults.standard.bool(forKey: "isPlaying") }
+        set { UserDefaults.standard.set(newValue, forKey: "isPlaying") }
+    }
+    
+    private var playbackSpeed: Double {
+        UserDefaults.standard.double(forKey: "playbackSpeed") == 0 ? 1.0 : UserDefaults.standard.double(forKey: "playbackSpeed")
+    }
+    
+    private var requestedFrameIndex: Int? {
+        get {
+            let value = UserDefaults.standard.integer(forKey: "currentFrameIndex")
+            return value >= 0 ? value : nil
+        }
+        set {
+            if let value = newValue {
+                UserDefaults.standard.set(value, forKey: "currentFrameIndex")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "currentFrameIndex")
+            }
+        }
+    }
+    
     // Performance optimizations: renderer reuse and preloading
     private var splatRenderer: SplatRenderer?
     private var nextFrameRenderer: SplatRenderer?
@@ -115,6 +139,10 @@ class VisionSceneRenderer {
         
         switch model {
         case .gaussianSplat(let url):
+            // Reset playback state for single frame
+            UserDefaults.standard.set(0, forKey: "totalFrames")
+            UserDefaults.standard.removeObject(forKey: "currentFrameIndex")
+            
             let splat = try SplatRenderer(device: device,
                                           colorFormat: layerRenderer.configuration.colorFormat,
                                           depthFormat: layerRenderer.configuration.depthFormat,
@@ -128,6 +156,12 @@ class VisionSceneRenderer {
             sequenceURLs = urls
             currentSequenceIndex = 0
             lastSequenceChangeTimestamp = Date()
+            
+            // Initialize playback state
+            UserDefaults.standard.set(urls.count, forKey: "totalFrames")
+            UserDefaults.standard.set(0, forKey: "currentFrameIndex")
+            UserDefaults.standard.set(true, forKey: "isPlaying")
+            requestedFrameIndex = 0
             
             if preloadAllFrames {
                 // Initialize array to hold all frames
@@ -155,6 +189,12 @@ class VisionSceneRenderer {
             currentDeltaFrameIndex = 0
             lastSequenceChangeTimestamp = Date()
             
+            // Initialize playback state
+            UserDefaults.standard.set(deltaFrameIndices.count, forKey: "totalFrames")
+            UserDefaults.standard.set(0, forKey: "currentFrameIndex")
+            UserDefaults.standard.set(true, forKey: "isPlaying")
+            requestedFrameIndex = 0
+            
             Self.log.info("📦 Loaded delta sequence metadata: \(decoder.frameCount) frames")
             print("📦 Loaded delta sequence metadata: \(decoder.frameCount) frames")
             
@@ -176,6 +216,10 @@ class VisionSceneRenderer {
                 loadNextDeltaFrameInBackground()
             }
         case .sampleBox:
+            // Reset playback state for sample box
+            UserDefaults.standard.set(0, forKey: "totalFrames")
+            UserDefaults.standard.removeObject(forKey: "currentFrameIndex")
+            
             modelRenderer = try! SampleBoxRenderer(device: device,
                                                    colorFormat: layerRenderer.configuration.colorFormat,
                                                    depthFormat: layerRenderer.configuration.depthFormat,
@@ -183,6 +227,9 @@ class VisionSceneRenderer {
                                                    maxViewCount: layerRenderer.properties.viewCount,
                                                    maxSimultaneousRenders: Constants.maxSimultaneousRenders)
         case .none:
+            // Reset playback state
+            UserDefaults.standard.set(0, forKey: "totalFrames")
+            UserDefaults.standard.removeObject(forKey: "currentFrameIndex")
             break
         }
     }
@@ -218,6 +265,7 @@ class VisionSceneRenderer {
         
         modelRenderer = splatRenderer
         currentSequenceIndex = index
+        UserDefaults.standard.set(index, forKey: "currentFrameIndex")
         
         let logMessage = """
             📊 Splat [\(index + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent)
@@ -230,8 +278,80 @@ class VisionSceneRenderer {
         Self.log.info("\(logMessage)")
     }
 
+    private func seekToFrame(_ index: Int) {
+        guard index >= 0 && index < sequenceURLs.count else { return }
+        
+        // Update immediately to prevent multiple seeks
+        requestedFrameIndex = nil
+        
+        Task {
+            do {
+                if preloadAllFrames, index < preloadedFrames.count, let preloaded = preloadedFrames[index] {
+                    // Use preloaded frame
+                    await MainActor.run {
+                        splatRenderer = preloaded
+                        modelRenderer = preloaded
+                        currentSequenceIndex = index
+                        UserDefaults.standard.set(index, forKey: "currentFrameIndex")
+                        lastSequenceChangeTimestamp = Date()
+                    }
+                } else {
+                    // Load frame asynchronously
+                    try await loadSequenceFrame(at: index)
+                    await MainActor.run {
+                        UserDefaults.standard.set(index, forKey: "currentFrameIndex")
+                        lastSequenceChangeTimestamp = Date()
+                    }
+                }
+            } catch {
+                Self.log.error("Failed to seek to frame \(index): \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    private func seekToDeltaFrame(_ index: Int) {
+        guard index >= 0 && index < deltaFrameIndices.count else { return }
+        
+        // Update immediately to prevent multiple seeks
+        requestedFrameIndex = nil
+        
+        Task {
+            do {
+                if preloadAllFrames, index < preloadedFrames.count, let preloaded = preloadedFrames[index] {
+                    // Use preloaded frame
+                    await MainActor.run {
+                        splatRenderer = preloaded
+                        modelRenderer = preloaded
+                        currentDeltaFrameIndex = index
+                        UserDefaults.standard.set(index, forKey: "currentFrameIndex")
+                        lastSequenceChangeTimestamp = Date()
+                    }
+                } else {
+                    // Load frame asynchronously
+                    try await loadDeltaFrame(at: index)
+                    await MainActor.run {
+                        UserDefaults.standard.set(index, forKey: "currentFrameIndex")
+                        lastSequenceChangeTimestamp = Date()
+                    }
+                }
+            } catch {
+                Self.log.error("Failed to seek to delta frame \(index): \(error.localizedDescription)")
+            }
+        }
+    }
+    
     private func updateSequence() {
         guard !sequenceURLs.isEmpty else { return }
+        
+        // Check for seek request
+        if let requestedIndex = requestedFrameIndex, requestedIndex != currentSequenceIndex {
+            seekToFrame(requestedIndex)
+            requestedFrameIndex = nil
+            return
+        }
+        
+        // Respect play/pause state
+        guard isPlaying else { return }
         
         let now = Date()
         guard let lastChange = lastSequenceChangeTimestamp else {
@@ -241,7 +361,10 @@ class VisionSceneRenderer {
             return
         }
         
-        if now.timeIntervalSince(lastChange) >= sequenceInterval {
+        // Adjust interval based on playback speed
+        let adjustedInterval = sequenceInterval / playbackSpeed
+        
+        if now.timeIntervalSince(lastChange) >= adjustedInterval {
             lastSequenceChangeTimestamp = now
             let nextIndex = (currentSequenceIndex + 1) % sequenceURLs.count
             
@@ -256,6 +379,7 @@ class VisionSceneRenderer {
                 splatRenderer = preloaded
                 modelRenderer = preloaded
                 currentSequenceIndex = nextIndex
+                UserDefaults.standard.set(nextIndex, forKey: "currentFrameIndex")
                 
                 let logMessage = """
                     📊 Splat [\(nextIndex + 1)/\(self.sequenceURLs.count)] \(url.lastPathComponent) (preloaded)
@@ -284,6 +408,7 @@ class VisionSceneRenderer {
                 splatRenderer = preloaded
                 modelRenderer = preloaded
                 currentSequenceIndex = nextIndex
+                UserDefaults.standard.set(nextIndex, forKey: "currentFrameIndex")
                 nextFrameRenderer = nil
                 loadingNextFrame = false
                 
@@ -611,6 +736,7 @@ class VisionSceneRenderer {
         
         modelRenderer = splatRenderer
         currentDeltaFrameIndex = index
+        UserDefaults.standard.set(index, forKey: "currentFrameIndex")
         
         let totalTime = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000
         
@@ -749,6 +875,16 @@ class VisionSceneRenderer {
     private func updateDeltaSequence() {
         guard !deltaFrameIndices.isEmpty else { return }
         
+        // Check for seek request
+        if let requestedIndex = requestedFrameIndex, requestedIndex != currentDeltaFrameIndex {
+            seekToDeltaFrame(requestedIndex)
+            requestedFrameIndex = nil
+            return
+        }
+        
+        // Respect play/pause state
+        guard isPlaying else { return }
+        
         let now = Date()
         guard let lastChange = lastSequenceChangeTimestamp else {
             lastSequenceChangeTimestamp = now
@@ -756,7 +892,10 @@ class VisionSceneRenderer {
             return
         }
         
-        if now.timeIntervalSince(lastChange) >= sequenceInterval {
+        // Adjust interval based on playback speed
+        let adjustedInterval = sequenceInterval / playbackSpeed
+        
+        if now.timeIntervalSince(lastChange) >= adjustedInterval {
             lastSequenceChangeTimestamp = now
             let nextIndex = (currentDeltaFrameIndex + 1) % deltaFrameIndices.count
             
@@ -768,6 +907,7 @@ class VisionSceneRenderer {
                 splatRenderer = preloaded
                 modelRenderer = preloaded
                 currentDeltaFrameIndex = nextIndex
+                UserDefaults.standard.set(nextIndex, forKey: "currentFrameIndex")
                 
                 let logMessage = """
                     📊 Delta Frame [\(nextIndex + 1)/\(deltaFrameIndices.count)] frame_\(frameIndex) (preloaded)
@@ -791,6 +931,7 @@ class VisionSceneRenderer {
                 splatRenderer = preloaded
                 modelRenderer = preloaded
                 currentDeltaFrameIndex = nextIndex
+                UserDefaults.standard.set(nextIndex, forKey: "currentFrameIndex")
                 nextFrameRenderer = nil
                 loadingNextFrame = false
                 
