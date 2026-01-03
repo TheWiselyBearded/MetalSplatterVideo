@@ -220,7 +220,21 @@ public class SplatRenderer {
 
     public func reset() {
         splatBuffer.count = 0
-        try? splatBuffer.setCapacity(0)
+        // Don't call setCapacity(0) - it silently fails and doesn't help
+        // Just clear the count, buffer will be reused when we add new points
+        // The buffer capacity remains, so we can reuse it for the next frame
+    }
+    
+    public func resetAndPrepareForNewFrame(expectedPointCount: Int = 0) {
+        splatBuffer.count = 0
+        // If we have an expected point count, pre-allocate to avoid reallocation during append
+        if expectedPointCount > 0 {
+            do {
+                try splatBuffer.ensureCapacity(expectedPointCount)
+            } catch {
+                // If pre-allocation fails, we'll allocate during add() instead
+            }
+        }
     }
 
     public func read(from url: URL) async throws {
@@ -369,11 +383,19 @@ public class SplatRenderer {
     }
 
     public func add(_ points: [SplatScenePoint]) throws {
+        // Ensure we have enough capacity BEFORE appending
+        // This may reallocate the buffer, so we need to do it before any append operations
         do {
             try ensureAdditionalCapacity(points.count)
         } catch {
             Self.log.error("Failed to grow buffers: \(error)")
-            return
+            throw error
+        }
+        
+        // Double-check capacity is sufficient before appending
+        guard splatBuffer.capacity >= splatBuffer.count + points.count else {
+            Self.log.error("Buffer capacity insufficient: have \(self.self.splatBuffer.capacity), need \(self.self.splatBuffer.count + points.count)")
+            throw NSError(domain: "SplatRenderer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Buffer capacity insufficient"])
         }
 
         splatBuffer.append(points.map { Splat($0) })

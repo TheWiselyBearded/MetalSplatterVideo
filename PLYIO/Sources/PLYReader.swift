@@ -37,8 +37,9 @@ public class PLYReader {
     enum Constants {
         static let headerStartToken = "\(PLYHeader.Keyword.ply.rawValue)\n".data(using: .utf8)!
         static let headerEndToken = "\(PLYHeader.Keyword.endHeader.rawValue)\n".data(using: .utf8)!
-        // Hold up to 16k of data at once before reclaiming. Higher numbers will use more data, but lower numbers will result in more frequent, somewhat expensive "move bytes" operations.
-        static let bodySizeForReclaim = 16*1024
+        // Hold up to 64k of data at once before reclaiming. Higher numbers will use more data, but lower numbers will result in more frequent, somewhat expensive "move bytes" operations.
+        // Increased from 16KB to 64KB to reduce reclaim frequency for large files
+        static let bodySizeForReclaim = 64*1024
 
         static let cr = UInt8(ascii: "\r")
         static let lf = UInt8(ascii: "\n")
@@ -58,6 +59,7 @@ public class PLYReader {
     private var currentElementGroup: Int = 0
     private var currentElementCountInGroup: Int = 0
     private var reusableElement = PLYElement(properties: [])
+    private var bodyPreAllocated = false
 
     public init(_ inputStream: InputStream) {
         self.inputStream = inputStream
@@ -76,8 +78,11 @@ public class PLYReader {
         bodyOffset = 0
         currentElementGroup = 0
         currentElementCountInGroup = 0
+        bodyPreAllocated = false
 
-        let bufferSize = 8*1024
+        // Increased buffer size from 8KB to 1MB for faster file reading (especially for large 63MB+ files)
+        // This reduces the number of read operations significantly
+        let bufferSize = 1024*1024  // 1MB instead of 8KB (128x larger)
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
         defer { buffer.deallocate() }
         var headerData = Data()
@@ -141,6 +146,32 @@ public class PLYReader {
                             let header = try PLYHeader.decodeASCII(from: headerData)
                             self.header = header
                             phase = .body
+                            
+                            // For binary PLY files, pre-allocate body Data with estimated size
+                            // This reduces reallocations during reading
+                            if (header.format == .binaryLittleEndian || header.format == .binaryBigEndian) && !bodyPreAllocated {
+                                // Estimate body size: sum of (element count * element size) for all elements
+                                var estimatedBodySize = 0
+                                for element in header.elements {
+                                    var elementSize = 0
+                                    for property in element.properties {
+                                        switch property.type {
+                                        case .primitive(let primitiveType):
+                                            elementSize += primitiveType.byteWidth
+                                        case .list(countType: let countType, valueType: let valueType):
+                                            // Estimate average list size (conservative: assume 10 items per list)
+                                            elementSize += countType.byteWidth + (10 * valueType.byteWidth)
+                                        }
+                                    }
+                                    estimatedBodySize += Int(element.count) * elementSize
+                                }
+                                // Pre-allocate with estimated size (add 10% buffer for safety)
+                                if estimatedBodySize > 0 {
+                                    body.reserveCapacity(Int(Double(estimatedBodySize) * 1.1))
+                                    bodyPreAllocated = true
+                                }
+                            }
+                            
                             delegate.didStartReading(withHeader: header)
                         } catch {
                             delegate.didFailReading(withError: error)

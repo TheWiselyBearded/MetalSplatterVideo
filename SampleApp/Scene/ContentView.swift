@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var isPickingFile = false
+    @State private var isPickingDirectory = false
 
 #if os(macOS)
     @Environment(\.openWindow) private var openWindow
@@ -36,6 +37,9 @@ struct ContentView: View {
     var body: some View {
 #if os(macOS) || os(visionOS)
         mainView
+            #if os(visionOS)
+            .background(SequenceWindowOpener())
+            #endif
 #elseif os(iOS)
         NavigationStack(path: $navigationPath) {
             mainView
@@ -84,6 +88,38 @@ struct ContentView: View {
                     break
                 }
             }
+
+            Spacer()
+
+            Button("Read Scene Directory") {
+                isPickingDirectory = true
+            }
+            .padding()
+            .buttonStyle(.borderedProminent)
+            .disabled(isPickingDirectory)
+#if os(visionOS)
+            .disabled(immersiveSpaceIsShown)
+#endif
+#if os(macOS) || os(visionOS)
+            .fileImporter(isPresented: $isPickingDirectory,
+                          allowedContentTypes: [.folder],
+                          allowsMultipleSelection: false) {
+                isPickingDirectory = false
+                switch $0 {
+                case .success(let urls):
+                    guard let url = urls.first else { break }
+                    _ = url.startAccessingSecurityScopedResource()
+                    Task {
+                        // This is a sample app. In a real app, this should be more tightly scoped, not using a silly timer.
+                        try await Task.sleep(for: .seconds(60))
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                    openWindow(value: ModelIdentifier.gaussianSplatSequence(url))
+                case .failure:
+                    break
+                }
+            }
+#endif
 
             Spacer()
 

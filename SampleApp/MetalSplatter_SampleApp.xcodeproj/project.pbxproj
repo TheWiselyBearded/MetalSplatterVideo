@@ -24,6 +24,10 @@
 		61791E162B42297B00302B57 /* MetalKitSceneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61791E142B42294700302B57 /* MetalKitSceneView.swift */; };
 		617E50C92B314C4800F99766 /* PLYIO in Frameworks */ = {isa = PBXBuildFile; productRef = 617E50C82B314C4800F99766 /* PLYIO */; };
 		617E50CB2B314C4800F99766 /* SplatIO in Frameworks */ = {isa = PBXBuildFile; productRef = 617E50CA2B314C4800F99766 /* SplatIO */; };
+		F51712EE2EFDB7E800ADE06F /* SplatSequenceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51712ED2EFDB7E800ADE06F /* SplatSequenceManager.swift */; };
+		F51712F02EFDBA3C00ADE06F /* SequenceNavigationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51712EF2EFDBA3C00ADE06F /* SequenceNavigationManager.swift */; };
+		F51712F42EFDBB3400ADE06F /* SequenceControlView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51712F22EFDBB3400ADE06F /* SequenceControlView.swift */; };
+		F51712F62EFDBDB000ADE06F /* SequenceWindowOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51712F52EFDBDB000ADE06F /* SequenceWindowOpener.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -42,6 +46,10 @@
 		61791E112B416DCF00302B57 /* Constants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Constants.swift; sourceTree = "<group>"; };
 		61791E142B42294700302B57 /* MetalKitSceneView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MetalKitSceneView.swift; sourceTree = "<group>"; };
 		617E50B02B314BE200F99766 /* MetalSplatter SampleApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "MetalSplatter SampleApp.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		F51712ED2EFDB7E800ADE06F /* SplatSequenceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplatSequenceManager.swift; sourceTree = "<group>"; };
+		F51712EF2EFDBA3C00ADE06F /* SequenceNavigationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SequenceNavigationManager.swift; sourceTree = "<group>"; };
+		F51712F22EFDBB3400ADE06F /* SequenceControlView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SequenceControlView.swift; sourceTree = "<group>"; };
+		F51712F52EFDBDB000ADE06F /* SequenceWindowOpener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SequenceWindowOpener.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -62,6 +70,7 @@
 		610347DF2B4689DB00693CE3 /* Model */ = {
 			isa = PBXGroup;
 			children = (
+				F51712ED2EFDB7E800ADE06F /* SplatSequenceManager.swift */,
 				61791DDB2B4154FB00302B57 /* ModelIdentifier.swift */,
 				61791DDE2B4154FB00302B57 /* ModelRenderer.swift */,
 				61791DDC2B4154FB00302B57 /* SampleBoxRenderer+ModelRenderer.swift */,
@@ -73,6 +82,9 @@
 		610347E02B468A0000693CE3 /* Scene */ = {
 			isa = PBXGroup;
 			children = (
+				F51712F52EFDBDB000ADE06F /* SequenceWindowOpener.swift */,
+				F51712F22EFDBB3400ADE06F /* SequenceControlView.swift */,
+				F51712EF2EFDBA3C00ADE06F /* SequenceNavigationManager.swift */,
 				610347D82B46861E00693CE3 /* ContentStageConfiguration.swift */,
 				61791DF72B41551F00302B57 /* ContentView.swift */,
 				61791E0E2B41685800302B57 /* MetalKitSceneRenderer.swift */,
@@ -212,11 +224,15 @@
 				610347DB2B46875700693CE3 /* VisionSceneRenderer.swift in Sources */,
 				610347D92B46864500693CE3 /* SampleApp.swift in Sources */,
 				61791E102B41688000302B57 /* MetalKitSceneRenderer.swift in Sources */,
+				F51712F42EFDBB3400ADE06F /* SequenceControlView.swift in Sources */,
 				61791DE02B4154FB00302B57 /* SplatRenderer+ModelRenderer.swift in Sources */,
 				61791DE82B4154FB00302B57 /* ModelRenderer.swift in Sources */,
 				61791DCF2B41544300302B57 /* Assets.xcassets in Sources */,
 				61791E132B416DD700302B57 /* Constants.swift in Sources */,
+				F51712F02EFDBA3C00ADE06F /* SequenceNavigationManager.swift in Sources */,
+				F51712EE2EFDB7E800ADE06F /* SplatSequenceManager.swift in Sources */,
 				61791E162B42297B00302B57 /* MetalKitSceneView.swift in Sources */,
+				F51712F62EFDBDB000ADE06F /* SequenceWindowOpener.swift in Sources */,
 				610347DC2B46875A00693CE3 /* ContentStageConfiguration.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -230,7 +246,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 75E89PG28K;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "";
@@ -246,6 +262,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.reza.dev.metalsplatter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
@@ -256,6 +273,7 @@
 				SWIFT_OBJC_BRIDGING_HEADER = "";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 26.0;
 			};
 			name = Debug;
 		};
@@ -265,7 +283,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 75E89PG28K;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "";
@@ -281,6 +299,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.reza.dev.metalsplatter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
@@ -291,6 +310,7 @@
 				SWIFT_OBJC_BRIDGING_HEADER = "";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 26.0;
 			};
 			name = Release;
 		};

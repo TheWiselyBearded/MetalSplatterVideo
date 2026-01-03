@@ -26,6 +26,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var rotation: Angle = .zero
 
     var drawableSize: CGSize = .zero
+    
+    // Sequence management
+    private var sequenceManager: SplatSequenceManager?
+    private var sequenceSplatRenderer: SplatRenderer?
 
     init?(_ metalKitView: MTKView) {
         self.device = metalKitView.device!
@@ -37,9 +41,19 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         metalKitView.sampleCount = 1
         metalKitView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
     }
+    
+    deinit {
+        stopSequence()
+        Task { @MainActor in
+            SequenceNavigationManager.shared.setMetalKitRenderer(nil)
+        }
+    }
 
     func load(_ model: ModelIdentifier?) async throws {
         guard model != self.model else { return }
+        
+        // Clean up previous sequence
+        stopSequence()
         self.model = model
 
         modelRenderer = nil
@@ -53,6 +67,30 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                 maxSimultaneousRenders: Constants.maxSimultaneousRenders)
             try await splat.read(from: url)
             modelRenderer = splat
+        case .gaussianSplatSequence(let directoryURL):
+            let manager = try SplatSequenceManager(directoryURL: directoryURL)
+            self.sequenceManager = manager
+            
+            let splat = try await SplatRenderer(device: device,
+                                                colorFormat: metalKitView.colorPixelFormat,
+                                                depthFormat: metalKitView.depthStencilPixelFormat,
+                                                sampleCount: metalKitView.sampleCount,
+                                                maxViewCount: 1,
+                                                maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+            self.sequenceSplatRenderer = splat
+            
+            // Load the first frame
+            if let firstURL = manager.currentFileURL {
+                try await splat.read(from: firstURL)
+                modelRenderer = splat
+            }
+            
+            // Register for keyboard navigation
+            Task { @MainActor in
+                SequenceNavigationManager.shared.setMetalKitRenderer(self)
+            }
+            
+            // No automatic sequencing - user will control via keyboard
         case .sampleBox:
             modelRenderer = try! await SampleBoxRenderer(device: device,
                                                          colorFormat: metalKitView.colorPixelFormat,
@@ -62,6 +100,35 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders)
         case .none:
             break
+        }
+    }
+    
+    private func stopSequence() {
+        sequenceManager = nil
+        sequenceSplatRenderer = nil
+    }
+    
+    func navigateSequenceFrame(forward: Bool) async {
+        guard let manager = sequenceManager,
+              let splat = sequenceSplatRenderer else { return }
+        
+        if forward {
+            manager.advanceToNextFrame()
+        } else {
+            manager.advanceToPreviousFrame()
+        }
+        
+        guard let nextURL = manager.currentFileURL else {
+            Self.log.warning("No URL found for frame")
+            return
+        }
+        
+        do {
+            splat.reset()
+            try await splat.read(from: nextURL)
+            Self.log.info("Loaded frame: \(nextURL.lastPathComponent) (\(manager.currentFrameNumber)/\(manager.frameCount))")
+        } catch {
+            Self.log.error("Failed to load frame \(nextURL.lastPathComponent): \(error.localizedDescription)")
         }
     }
 

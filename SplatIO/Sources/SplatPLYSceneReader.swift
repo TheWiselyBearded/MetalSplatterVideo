@@ -53,6 +53,9 @@ private class SplatPLYSceneReaderStream {
                                                 opacity: .linearFloat(.zero),
                                                 scale: .exponent(.zero),
                                                 rotation: .init(vector: .zero))
+    // Batch processing to reduce delegate call overhead
+    private var batchedPoints: [SplatScenePoint] = []
+    private static let batchSize = 1000  // Process 1000 points at a time
 
     func read(_ ply: PLYReader, to delegate: SplatSceneReaderDelegate) {
         self.delegate = delegate
@@ -60,10 +63,17 @@ private class SplatPLYSceneReaderStream {
         elementMapping = nil
         expectedPointCount = 0
         pointCount = 0
+        batchedPoints.removeAll(keepingCapacity: true)
 
         ply.read(to: self)
 
         assert(!active)
+    }
+    
+    private func flushBatch() {
+        guard !batchedPoints.isEmpty else { return }
+        delegate?.didRead(points: batchedPoints)
+        batchedPoints.removeAll(keepingCapacity: true)
     }
 }
 
@@ -100,7 +110,12 @@ extension SplatPLYSceneReaderStream: PLYReaderDelegate {
         do {
             try elementMapping.apply(from: element, to: &reusablePoint)
             pointCount += 1
-            delegate?.didRead(points: [ reusablePoint ])
+            
+            // Batch points to reduce delegate call overhead
+            batchedPoints.append(reusablePoint)
+            if batchedPoints.count >= Self.batchSize {
+                flushBatch()
+            }
         } catch {
             delegate?.didFailReading(withError: error)
             active = false
@@ -116,6 +131,9 @@ extension SplatPLYSceneReaderStream: PLYReaderDelegate {
             return
         }
 
+        // Flush any remaining batched points
+        flushBatch()
+        
         delegate?.didFinishReading()
         active = false
     }

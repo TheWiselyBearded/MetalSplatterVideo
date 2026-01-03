@@ -35,6 +35,16 @@ class VisionSceneRenderer {
 
     let arSession: ARKitSession
     let worldTracking: WorldTrackingProvider
+    
+    // Sequence management
+    private var sequenceManager: SplatSequenceManager?
+    private var isNavigating = false
+    private var preloadedRenderer: SplatRenderer?
+    private var preloadedFrameIndex: Int = -1
+    
+    // Renderer pool for reuse to avoid expensive buffer allocations
+    private var rendererPool: [SplatRenderer] = []
+    private var expectedPointCount: Int = 0
 
     init(_ layerRenderer: LayerRenderer) {
         self.layerRenderer = layerRenderer
@@ -44,9 +54,20 @@ class VisionSceneRenderer {
         worldTracking = WorldTrackingProvider()
         arSession = ARKitSession()
     }
+    
+    deinit {
+        stopSequence()
+        Task { @MainActor in
+            SequenceNavigationManager.shared.setVisionRenderer(nil)
+            SequenceNavigationManager.shared.shouldShowControls = false
+        }
+    }
 
     func load(_ model: ModelIdentifier?) async throws {
         guard model != self.model else { return }
+        
+        // Clean up previous sequence
+        stopSequence()
         self.model = model
 
         modelRenderer = nil
@@ -60,6 +81,30 @@ class VisionSceneRenderer {
                                           maxSimultaneousRenders: Constants.maxSimultaneousRenders)
             try await splat.read(from: url)
             modelRenderer = splat
+        case .gaussianSplatSequence(let directoryURL):
+            let manager = try SplatSequenceManager(directoryURL: directoryURL)
+            self.sequenceManager = manager
+            
+            // Load the first frame into a new renderer
+            if let firstURL = manager.currentFileURL {
+                let splat = try getOrCreateRenderer()
+                try await splat.read(from: firstURL)
+                modelRenderer = splat
+                
+                // Track expected point count for future pre-allocations
+                expectedPointCount = splat.splatCount
+                
+                // Preload next frame in background
+                Task {
+                    await preloadNextFrame()
+                }
+            }
+            
+            // Register for navigation and show control window
+            await MainActor.run {
+                SequenceNavigationManager.shared.setVisionRenderer(self)
+                SequenceNavigationManager.shared.shouldShowControls = true
+            }
         case .sampleBox:
             modelRenderer = try! SampleBoxRenderer(device: device,
                                                    colorFormat: layerRenderer.configuration.colorFormat,
@@ -69,6 +114,205 @@ class VisionSceneRenderer {
                                                    maxSimultaneousRenders: Constants.maxSimultaneousRenders)
         case .none:
             break
+        }
+    }
+    
+    private func stopSequence() {
+        sequenceManager = nil
+        preloadedRenderer = nil
+        preloadedFrameIndex = -1
+        rendererPool.removeAll()
+        expectedPointCount = 0
+    }
+    
+    /// Get or create a renderer from the pool to avoid expensive buffer allocations
+    private func getOrCreateRenderer() throws -> SplatRenderer {
+        if let renderer = rendererPool.popLast() {
+            return renderer
+        }
+        return try SplatRenderer(device: device,
+                                colorFormat: layerRenderer.configuration.colorFormat,
+                                depthFormat: layerRenderer.configuration.depthFormat,
+                                sampleCount: 1,
+                                maxViewCount: layerRenderer.properties.viewCount,
+                                maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+    }
+    
+    /// Return a renderer to the pool for reuse
+    private func returnRendererToPool(_ renderer: SplatRenderer) {
+        // Only keep a small pool (2 renderers) to limit memory usage
+        if rendererPool.count < 2 {
+            rendererPool.append(renderer)
+        }
+    }
+    
+    private func preloadNextFrame() async {
+        guard let manager = sequenceManager else { return }
+        
+        let preloadStartTime = Date()
+        
+        // Calculate next frame index
+        let currentIndex = manager.currentFrameNumber - 1
+        let nextIndex = (currentIndex + 1) % manager.frameCount
+        
+        // Skip if already preloaded
+        guard preloadedFrameIndex != nextIndex else { return }
+        
+        // Get next frame URL
+        let savedIndex = manager.currentFrameNumber - 1
+        manager.advanceToNextFrame()
+        guard let nextURL = manager.currentFileURL else {
+            // Restore index
+            while manager.currentFrameNumber - 1 != savedIndex {
+                manager.advanceToPreviousFrame()
+            }
+            return
+        }
+        // Restore current index
+        while manager.currentFrameNumber - 1 != savedIndex {
+            manager.advanceToPreviousFrame()
+        }
+        
+        do {
+            // Get file size for logging
+            let fileAttributes = try? FileManager.default.attributesOfItem(atPath: nextURL.path)
+            let fileSize = (fileAttributes?[.size] as? Int64) ?? 0
+            let fileSizeMB = Double(fileSize) / (1024.0 * 1024.0)
+            
+            let rendererCreateTime = Date()
+            let preloaded = try getOrCreateRenderer()
+            // Pre-allocate buffers if we know the expected point count
+            if expectedPointCount > 0 {
+                preloaded.resetAndPrepareForNewFrame(expectedPointCount: expectedPointCount)
+            } else {
+                preloaded.reset()
+            }
+            let rendererCreateDuration = -rendererCreateTime.timeIntervalSinceNow
+            
+            let readStartTime = Date()
+            try await preloaded.read(from: nextURL)
+            let readDuration = -readStartTime.timeIntervalSinceNow
+            
+            // Update expected point count if this is the first frame or if it changed
+            if expectedPointCount == 0 || abs(preloaded.splatCount - expectedPointCount) > expectedPointCount / 10 {
+                expectedPointCount = preloaded.splatCount
+            }
+            
+            preloadedRenderer = preloaded
+            preloadedFrameIndex = nextIndex
+            
+            let totalTime = -preloadStartTime.timeIntervalSinceNow
+            Self.log.info("🔄 PRELOAD: \(nextURL.lastPathComponent) | Size: \(String(format: "%.2f", fileSizeMB))MB | Create: \(String(format: "%.3f", rendererCreateDuration))s | Read: \(String(format: "%.3f", readDuration))s | Total: \(String(format: "%.3f", totalTime))s")
+        } catch {
+            // Preload failed, will load on demand
+            preloadedRenderer = nil
+            preloadedFrameIndex = -1
+            Self.log.warning("⚠️ PRELOAD FAILED: \(nextURL.lastPathComponent) - \(error.localizedDescription)")
+        }
+    }
+    
+    func navigateSequenceFrame(forward: Bool) async {
+        // Prevent concurrent navigation calls
+        guard !isNavigating else {
+            Self.log.warning("Navigation already in progress, skipping")
+            return
+        }
+        
+        guard let manager = sequenceManager else { 
+            Self.log.warning("No sequence manager available")
+            return 
+        }
+        
+        isNavigating = true
+        defer { isNavigating = false }
+        
+        let navigationStartTime = Date()
+        
+        // Advance frame index
+        if forward {
+            manager.advanceToNextFrame()
+        } else {
+            manager.advanceToPreviousFrame()
+        }
+        
+        guard let nextURL = manager.currentFileURL else {
+            Self.log.warning("No URL found for frame")
+            return
+        }
+        
+        let currentFrameIndex = manager.currentFrameNumber - 1
+        
+        // Check if we have a preloaded renderer for this frame
+        if let preloaded = preloadedRenderer, preloadedFrameIndex == currentFrameIndex {
+            // Use preloaded renderer - instant swap!
+            let swapTime = Date()
+            
+            // Return old renderer to pool if it exists
+            if let oldRenderer = modelRenderer as? SplatRenderer, oldRenderer !== preloaded {
+                returnRendererToPool(oldRenderer)
+            }
+            
+            modelRenderer = preloaded
+            preloadedRenderer = nil
+            preloadedFrameIndex = -1
+            let swapDuration = -swapTime.timeIntervalSinceNow
+            let totalTime = -navigationStartTime.timeIntervalSinceNow
+            
+            Self.log.info("⚡ INSTANT: \(nextURL.lastPathComponent) (\(manager.currentFrameNumber)/\(manager.frameCount)) | Swap: \(String(format: "%.3f", swapDuration))s | Total: \(String(format: "%.3f", totalTime))s")
+            
+            // Preload next frame in background
+            Task {
+                await preloadNextFrame()
+            }
+        } else {
+            // Load on demand
+            let loadStartTime = Date()
+            
+            do {
+                // Get file size for logging
+                let fileAttributes = try? FileManager.default.attributesOfItem(atPath: nextURL.path)
+                let fileSize = (fileAttributes?[.size] as? Int64) ?? 0
+                let fileSizeMB = Double(fileSize) / (1024.0 * 1024.0)
+                
+                let rendererCreateTime = Date()
+                let newSplat = try getOrCreateRenderer()
+                // Pre-allocate buffers if we know the expected point count
+                if expectedPointCount > 0 {
+                    newSplat.resetAndPrepareForNewFrame(expectedPointCount: expectedPointCount)
+                } else {
+                    newSplat.reset()
+                }
+                let rendererCreateDuration = -rendererCreateTime.timeIntervalSinceNow
+                
+                let readStartTime = Date()
+                try await newSplat.read(from: nextURL)
+                let readDuration = -readStartTime.timeIntervalSinceNow
+                
+                // Update expected point count if this is the first frame or if it changed
+                if expectedPointCount == 0 || abs(newSplat.splatCount - expectedPointCount) > expectedPointCount / 10 {
+                    expectedPointCount = newSplat.splatCount
+                }
+                
+                let swapTime = Date()
+                // Return old renderer to pool if it exists
+                if let oldRenderer = modelRenderer as? SplatRenderer, oldRenderer !== newSplat {
+                    returnRendererToPool(oldRenderer)
+                }
+                modelRenderer = newSplat
+                let swapDuration = -swapTime.timeIntervalSinceNow
+                
+                let totalLoadTime = -loadStartTime.timeIntervalSinceNow
+                let totalNavTime = -navigationStartTime.timeIntervalSinceNow
+                
+                Self.log.info("📦 LOAD: \(nextURL.lastPathComponent) (\(manager.currentFrameNumber)/\(manager.frameCount)) | Size: \(String(format: "%.2f", fileSizeMB))MB | Create: \(String(format: "%.3f", rendererCreateDuration))s | Read: \(String(format: "%.3f", readDuration))s | Swap: \(String(format: "%.3f", swapDuration))s | Load: \(String(format: "%.3f", totalLoadTime))s | Nav: \(String(format: "%.3f", totalNavTime))s")
+                
+                // Preload next frame in background
+                Task {
+                    await preloadNextFrame()
+                }
+            } catch {
+                Self.log.error("❌ FAILED: \(nextURL.lastPathComponent) - \(error.localizedDescription)")
+            }
         }
     }
 
@@ -95,23 +339,22 @@ class VisionSceneRenderer {
         // Turn common 3D GS PLY files rightside-up. This isn't generally meaningful, it just
         // happens to be a useful default for the most common datasets at the moment.
         let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
+        // Rotate 180 degrees around Y axis to face the user (model was facing away)
+        let faceForwardRotation = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 1, 0))
+        // Scale down by 2/3
+        let scalingMatrix = matrix4x4_scale(2.0/3.0, 2.0/3.0, 2.0/3.0)
 
         let simdDeviceAnchor = deviceAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
 
-        return drawable.views.map { view in
+        return drawable.views.enumerated().map { (index, view) in
             let userViewpointMatrix = (simdDeviceAnchor * view.transform).inverse
-            let projectionMatrix = ProjectiveTransform3D(leftTangent: Double(view.tangents[0]),
-                                                         rightTangent: Double(view.tangents[1]),
-                                                         topTangent: Double(view.tangents[2]),
-                                                         bottomTangent: Double(view.tangents[3]),
-                                                         nearZ: Double(drawable.depthRange.y),
-                                                         farZ: Double(drawable.depthRange.x),
-                                                         reverseZ: true)
+            // New method to get the projection matrix (replaces deprecated tangents)
+            let projectionMatrix = drawable.computeProjection(viewIndex: index)
             let screenSize = SIMD2(x: Int(view.textureMap.viewport.width),
                                    y: Int(view.textureMap.viewport.height))
             return ModelRendererViewportDescriptor(viewport: view.textureMap.viewport,
-                                                   projectionMatrix: .init(projectionMatrix),
-                                                   viewMatrix: userViewpointMatrix * translationMatrix * rotationMatrix * commonUpCalibration,
+                                                   projectionMatrix: projectionMatrix,
+                                                   viewMatrix: userViewpointMatrix * translationMatrix * rotationMatrix * faceForwardRotation * scalingMatrix * commonUpCalibration,
                                                    screenSize: screenSize)
         }
     }
@@ -154,8 +397,6 @@ class VisionSceneRenderer {
         commandBuffer.addCompletedHandler { (_ commandBuffer)-> Swift.Void in
             semaphore.signal()
         }
-
-        updateRotation()
 
         let viewports = self.viewports(drawable: drawable, deviceAnchor: deviceAnchor)
 
