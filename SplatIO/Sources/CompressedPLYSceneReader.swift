@@ -948,13 +948,25 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
             let b = UInt8((colorPacked >> 8) & 0xFF)   // Bits 8-15
             let a = UInt8(colorPacked & 0xFF)          // Bits 0-7 (opacity)
             
-            // Use chunk-specific bounds for color dequantization
-            sh0 = SIMD3<Float>(
+            // Packed colors are RGB [0, 1], not SH coefficients (per gsply spec)
+            // Step 1: Dequantize to RGB [0, 1] using chunk-specific bounds
+            let rgb = SIMD3<Float>(
                 x: dequantizeUInt8(r, min: chunkBounds.colorMin.x, max: chunkBounds.colorMax.x),
                 y: dequantizeUInt8(g, min: chunkBounds.colorMin.y, max: chunkBounds.colorMax.y),
                 z: dequantizeUInt8(b, min: chunkBounds.colorMin.z, max: chunkBounds.colorMax.z)
             )
             
+            // Step 2: Convert RGB [0, 1] to SH coefficients using (rgb - 0.5) * INV_SH_C0
+            // Same formula as SplatScenePoint.Color.linearToPrimarySphericalHarmonic
+            let SH_C0: Float = 0.28209479177387814
+            let INV_SH_C0: Float = 1.0 / SH_C0
+            sh0 = SIMD3<Float>(
+                x: (rgb.x - 0.5) * INV_SH_C0,
+                y: (rgb.y - 0.5) * INV_SH_C0,
+                z: (rgb.z - 0.5) * INV_SH_C0
+            )
+            
+            // Opacity still uses chunk-specific bounds (logit space)
             opacity = dequantizeUInt8(a, min: chunkBounds.opacityMin, max: chunkBounds.opacityMax)
         } else {
             // Fallback: check if there's a separate packed_opacity property
@@ -967,10 +979,20 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
                     let g = UInt8((colorPacked >> 8) & 0xFF)   // Bits 8-15
                     let b = UInt8(colorPacked & 0xFF)          // Bits 0-7
                     
-                    sh0 = SIMD3<Float>(
+                    // Step 1: Dequantize to RGB [0, 1] using chunk-specific bounds
+                    let rgb = SIMD3<Float>(
                         x: dequantizeUInt8(r, min: chunkBounds.colorMin.x, max: chunkBounds.colorMax.x),
                         y: dequantizeUInt8(g, min: chunkBounds.colorMin.y, max: chunkBounds.colorMax.y),
                         z: dequantizeUInt8(b, min: chunkBounds.colorMin.z, max: chunkBounds.colorMax.z)
+                    )
+                    
+                    // Step 2: Convert RGB [0, 1] to SH coefficients
+                    let SH_C0: Float = 0.28209479177387814
+                    let INV_SH_C0: Float = 1.0 / SH_C0
+                    sh0 = SIMD3<Float>(
+                        x: (rgb.x - 0.5) * INV_SH_C0,
+                        y: (rgb.y - 0.5) * INV_SH_C0,
+                        z: (rgb.z - 0.5) * INV_SH_C0
                     )
                 } else {
                     print("[PackedElementInputMapping] ERROR: packed_color type: \(packedColor)")
