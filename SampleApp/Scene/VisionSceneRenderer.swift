@@ -360,7 +360,16 @@ class VisionSceneRenderer {
     private func viewports(drawable: LayerRenderer.Drawable, deviceAnchor: DeviceAnchor?) -> [ModelRendererViewportDescriptor] {
         let rotationMatrix = matrix4x4_rotation(radians: Float(rotation.radians),
                                                 axis: Constants.rotationAxis)
-        let translationMatrix = matrix4x4_translation(0.0, 0.0, Constants.modelCenterZ)
+        
+        // Use a closer position for compressed PLY sequences to center them better in front of the user
+        let zOffset: Float
+        if case .compressedPlySequence = model {
+            zOffset = -3.0  // Closer position for compressed PLY sequences
+        } else {
+            zOffset = Constants.modelCenterZ
+        }
+        
+        let translationMatrix = matrix4x4_translation(0.0, 0.0, zOffset)
         // Turn common 3D GS PLY files rightside-up. This isn't generally meaningful, it just
         // happens to be a useful default for the most common datasets at the moment.
         let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
