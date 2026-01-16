@@ -91,6 +91,29 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             }
             
             // No automatic sequencing - user will control via keyboard
+        case .compressedPlySequence(let directoryURL):
+            // Force compressed format - skip detection
+            let manager = try SplatSequenceManager(directoryURL: directoryURL, forceCompressedFormat: true)
+            self.sequenceManager = manager
+            
+            let splat = try await SplatRenderer(device: device,
+                                                colorFormat: metalKitView.colorPixelFormat,
+                                                depthFormat: metalKitView.depthStencilPixelFormat,
+                                                sampleCount: metalKitView.sampleCount,
+                                                maxViewCount: 1,
+                                                maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+            self.sequenceSplatRenderer = splat
+            
+            // Load the first frame
+            if let firstURL = manager.currentFileURL {
+                try await splat.read(from: firstURL)
+                modelRenderer = splat
+            }
+            
+            // Register for keyboard navigation
+            Task { @MainActor in
+                SequenceNavigationManager.shared.setMetalKitRenderer(self)
+            }
         case .sampleBox:
             modelRenderer = try! await SampleBoxRenderer(device: device,
                                                          colorFormat: metalKitView.colorPixelFormat,

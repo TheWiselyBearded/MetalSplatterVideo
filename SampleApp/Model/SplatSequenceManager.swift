@@ -5,6 +5,7 @@ class SplatSequenceManager {
     private let directoryURL: URL
     private let fileURLs: [URL]
     private var currentIndex: Int = 0
+    private let forceCompressedFormat: Bool
     
     var currentFileURL: URL? {
         guard !fileURLs.isEmpty else { return nil }
@@ -19,8 +20,9 @@ class SplatSequenceManager {
         currentIndex + 1
     }
     
-    init(directoryURL: URL) throws {
+    init(directoryURL: URL, forceCompressedFormat: Bool = false) throws {
         self.directoryURL = directoryURL
+        self.forceCompressedFormat = forceCompressedFormat
         
         // Get all PLY and splat files from the directory (non-recursive)
         let fileManager = FileManager.default
@@ -52,6 +54,23 @@ class SplatSequenceManager {
         
         guard !self.fileURLs.isEmpty else {
             throw Error.noValidFilesFound
+        }
+        
+        // Detect and cache format for the entire directory
+        // Assumes all files in directory share the same format
+        if forceCompressedFormat {
+            // Explicitly set format as compressed for ALL PLY files in the directory
+            for plyFile in fileURLs where plyFile.pathExtension.lowercased() == "ply" {
+                PLYFormatCache.shared.setFormat(
+                    for: plyFile,
+                    formatType: .compressed,
+                    shDegree: nil
+                )
+            }
+        } else if let firstPLYFile = fileURLs.first(where: { $0.pathExtension.lowercased() == "ply" }) {
+            // Auto-detect format from first file
+            let detection = PLYFormatCache.shared.getFormat(for: firstPLYFile)
+            // Format is now cached for the entire directory, avoiding redundant detection
         }
     }
     

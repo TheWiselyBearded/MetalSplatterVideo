@@ -105,6 +105,31 @@ class VisionSceneRenderer {
                 SequenceNavigationManager.shared.setVisionRenderer(self)
                 SequenceNavigationManager.shared.shouldShowControls = true
             }
+        case .compressedPlySequence(let directoryURL):
+            // Force compressed format - skip detection
+            let manager = try SplatSequenceManager(directoryURL: directoryURL, forceCompressedFormat: true)
+            self.sequenceManager = manager
+            
+            // Load the first frame into a new renderer
+            if let firstURL = manager.currentFileURL {
+                let splat = try getOrCreateRenderer()
+                try await splat.read(from: firstURL)
+                modelRenderer = splat
+                
+                // Track expected point count for future pre-allocations
+                expectedPointCount = splat.splatCount
+                
+                // Preload next frame in background
+                Task {
+                    await preloadNextFrame()
+                }
+            }
+            
+            // Register for navigation and show control window
+            await MainActor.run {
+                SequenceNavigationManager.shared.setVisionRenderer(self)
+                SequenceNavigationManager.shared.shouldShowControls = true
+            }
         case .sampleBox:
             modelRenderer = try! SampleBoxRenderer(device: device,
                                                    colorFormat: layerRenderer.configuration.colorFormat,

@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @State private var isPickingFile = false
     @State private var isPickingDirectory = false
+    @State private var isPickingCompressedDirectory = false
 
 #if os(macOS)
     @Environment(\.openWindow) private var openWindow
@@ -115,6 +116,38 @@ struct ContentView: View {
                         url.stopAccessingSecurityScopedResource()
                     }
                     openWindow(value: ModelIdentifier.gaussianSplatSequence(url))
+                case .failure:
+                    break
+                }
+            }
+#endif
+
+            Spacer()
+
+            Button("Read Compressed PLY Directory") {
+                isPickingCompressedDirectory = true
+            }
+            .padding()
+            .buttonStyle(.borderedProminent)
+            .disabled(isPickingCompressedDirectory)
+#if os(visionOS)
+            .disabled(immersiveSpaceIsShown)
+#endif
+#if os(macOS) || os(visionOS)
+            .fileImporter(isPresented: $isPickingCompressedDirectory,
+                          allowedContentTypes: [.folder],
+                          allowsMultipleSelection: false) {
+                isPickingCompressedDirectory = false
+                switch $0 {
+                case .success(let urls):
+                    guard let url = urls.first else { break }
+                    _ = url.startAccessingSecurityScopedResource()
+                    Task {
+                        // This is a sample app. In a real app, this should be more tightly scoped, not using a silly timer.
+                        try await Task.sleep(for: .seconds(60))
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                    openWindow(value: ModelIdentifier.compressedPlySequence(url))
                 case .failure:
                     break
                 }
