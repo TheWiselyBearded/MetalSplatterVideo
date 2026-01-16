@@ -252,7 +252,7 @@ private class TrackingSplatSceneReaderDelegate: SplatSceneReaderDelegate {
 /// Protocol for element mappings that can convert PLY elements to SplatScenePoint
 private protocol ElementInputMappingProtocol {
     var elementTypeIndex: Int { get }
-    func apply(from element: PLYElement, to result: inout SplatScenePoint) throws
+    func apply(from element: PLYElement, to result: inout SplatScenePoint, pointIndex: UInt32) throws
 }
 
 /// Internal stream handler for compressed PLY reading with decompression
@@ -272,6 +272,9 @@ private class CompressedPLYSceneReaderStream {
     private var batchedPoints: [SplatScenePoint] = []
     private static let batchSize = 1000
     private let quantizationRanges: CompressedPLYDecompressor.QuantizationRanges
+    
+    // Per-chunk metadata array (256 vertices per chunk)
+    private var chunkMetadataArray: [PackedElementInputMapping.ChunkMetadata] = []
     
     init(quantizationRanges: CompressedPLYDecompressor.QuantizationRanges) {
         self.quantizationRanges = quantizationRanges
@@ -370,17 +373,21 @@ extension CompressedPLYSceneReaderStream: PLYReaderDelegate {
             return
         }
         
-        // If this is a chunk element, we might want to store metadata (for future use)
+        // If this is a chunk element, read metadata and compute global bounds
         if elementHeader.name == "chunk" {
-            // For now, we'll skip chunks - they're metadata
-            // In the future, we could read chunk bounds here and use them for vertex dequantization
+            readChunkMetadata(element: element, elementHeader: elementHeader)
             return
         }
         
         guard typeIndex == elementMapping.elementTypeIndex else { return }
         do {
-            try elementMapping.apply(from: element, to: &reusablePoint)
+            try elementMapping.apply(from: element, to: &reusablePoint, pointIndex: pointCount)
             pointCount += 1
+            
+            // Debug: log first few points to verify dequantization
+            if pointCount <= 5 {
+                print("[CompressedPLYSceneReaderStream] Point \(pointCount): position=\(reusablePoint.position), scale=\(reusablePoint.scale), opacity=\(reusablePoint.opacity)")
+            }
             
             batchedPoints.append(reusablePoint)
             if batchedPoints.count >= Self.batchSize {
@@ -390,6 +397,97 @@ extension CompressedPLYSceneReaderStream: PLYReaderDelegate {
             delegate?.didFailReading(withError: error)
             active = false
             return
+        }
+    }
+    
+    /// Read chunk metadata and store per-chunk bounds
+    private func readChunkMetadata(element: PLYElement, elementHeader: PLYHeader.Element) {
+        // Find chunk property indices
+        guard let minXIdx = elementHeader.index(forPropertyNamed: "min_x"),
+              let minYIdx = elementHeader.index(forPropertyNamed: "min_y"),
+              let minZIdx = elementHeader.index(forPropertyNamed: "min_z"),
+              let maxXIdx = elementHeader.index(forPropertyNamed: "max_x"),
+              let maxYIdx = elementHeader.index(forPropertyNamed: "max_y"),
+              let maxZIdx = elementHeader.index(forPropertyNamed: "max_z"),
+              let minScaleXIdx = elementHeader.index(forPropertyNamed: "min_scale_x"),
+              let maxScaleXIdx = elementHeader.index(forPropertyNamed: "max_scale_x"),
+              let minRIdx = elementHeader.index(forPropertyNamed: "min_r"),
+              let maxRIdx = elementHeader.index(forPropertyNamed: "max_r") else {
+            print("[CompressedPLYSceneReaderStream] WARNING: Chunk element missing required properties")
+            return
+        }
+        
+        // Extract values from element
+        guard case .float32(let minX) = element.properties[minXIdx],
+              case .float32(let minY) = element.properties[minYIdx],
+              case .float32(let minZ) = element.properties[minZIdx],
+              case .float32(let maxX) = element.properties[maxXIdx],
+              case .float32(let maxY) = element.properties[maxYIdx],
+              case .float32(let maxZ) = element.properties[maxZIdx],
+              case .float32(let minScaleX) = element.properties[minScaleXIdx],
+              case .float32(let maxScaleX) = element.properties[maxScaleXIdx],
+              case .float32(let minR) = element.properties[minRIdx],
+              case .float32(let maxR) = element.properties[maxRIdx] else {
+            print("[CompressedPLYSceneReaderStream] WARNING: Chunk properties not float32")
+            return
+        }
+        
+        // Get scale Y/Z and color G/B if available, otherwise use X/R values
+        let minScaleY = elementHeader.index(forPropertyNamed: "min_scale_y").flatMap { 
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? minScaleX
+        let maxScaleY = elementHeader.index(forPropertyNamed: "max_scale_y").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? maxScaleX
+        let minScaleZ = elementHeader.index(forPropertyNamed: "min_scale_z").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? minScaleX
+        let maxScaleZ = elementHeader.index(forPropertyNamed: "max_scale_z").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? maxScaleX
+        
+        let minG = elementHeader.index(forPropertyNamed: "min_g").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? minR
+        let maxG = elementHeader.index(forPropertyNamed: "max_g").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? maxR
+        let minB = elementHeader.index(forPropertyNamed: "min_b").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? minR
+        let maxB = elementHeader.index(forPropertyNamed: "max_b").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? maxR
+        
+        // Get opacity bounds if available
+        let minOpacity: Float = elementHeader.index(forPropertyNamed: "min_opacity").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? -10.0
+        let maxOpacity: Float = elementHeader.index(forPropertyNamed: "max_opacity").flatMap {
+            if case .float32(let val) = element.properties[$0] { return val } else { return nil }
+        } ?? 10.0
+        
+        let chunkMetadata = PackedElementInputMapping.ChunkMetadata(
+            positionMin: SIMD3<Float>(minX, minY, minZ),
+            positionMax: SIMD3<Float>(maxX, maxY, maxZ),
+            scaleMin: min(minScaleX, minScaleY, minScaleZ),
+            scaleMax: max(maxScaleX, maxScaleY, maxScaleZ),
+            opacityMin: minOpacity,
+            opacityMax: maxOpacity,
+            colorMin: SIMD3<Float>(minR, minG, minB),
+            colorMax: SIMD3<Float>(maxR, maxG, maxB)
+        )
+        
+        // Store per-chunk metadata (256 vertices per chunk)
+        chunkMetadataArray.append(chunkMetadata)
+        
+        // Update the mapping's chunk metadata array if it's a PackedElementInputMapping
+        if var packedMapping = elementMapping as? PackedElementInputMapping {
+            packedMapping.chunkMetadata = chunkMetadataArray
+            elementMapping = packedMapping
+            if chunkMetadataArray.count <= 5 || chunkMetadataArray.count % 100 == 0 {
+                print("[CompressedPLYSceneReaderStream] Stored chunk \(chunkMetadataArray.count) metadata: position [\(chunkMetadata.positionMin)] to [\(chunkMetadata.positionMax)]")
+            }
         }
     }
     
@@ -566,7 +664,7 @@ private struct CompressedElementInputMapping: ElementInputMappingProtocol {
         return nil
     }
     
-    func apply(from element: PLYElement, to result: inout SplatScenePoint) throws {
+    func apply(from element: PLYElement, to result: inout SplatScenePoint, pointIndex: UInt32) throws {
         // Dequantize position
         result.position = SIMD3(
             x: try dequantizeProperty(element, index: positionXPropertyIndex, name: "x"),
@@ -638,7 +736,7 @@ private struct CompressedElementInputMapping: ElementInputMappingProtocol {
 /// Used for splat-transform compressed PLY files with chunked format
 private struct PackedElementInputMapping: ElementInputMappingProtocol {
     let elementTypeIndex: Int
-    let quantizationRanges: CompressedPLYDecompressor.QuantizationRanges
+    var quantizationRanges: CompressedPLYDecompressor.QuantizationRanges
     
     // Property indices for packed properties
     let packedPositionPropertyIndex: Int
@@ -698,7 +796,7 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
         }
         
         // Find chunk element for metadata (if present)
-        var chunkMetadata: [ChunkMetadata] = []
+        let chunkMetadata: [ChunkMetadata] = []
         if let chunkElementIndex = header.elements.firstIndex(where: { $0.name == "chunk" }) {
             print("[PackedElementInputMapping] Found chunk element with \(header.elements[chunkElementIndex].count) chunks")
             // We'll read chunk metadata when we process chunks
@@ -719,7 +817,27 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
         )
     }
     
-    func apply(from element: PLYElement, to result: inout SplatScenePoint) throws {
+    func apply(from element: PLYElement, to result: inout SplatScenePoint, pointIndex: UInt32) throws {
+        // Calculate which chunk this vertex belongs to (256 vertices per chunk)
+        let chunkIndex = Int(pointIndex) / 256
+        let chunkBounds: ChunkMetadata
+        
+        if chunkIndex < chunkMetadata.count && !chunkMetadata.isEmpty {
+            chunkBounds = chunkMetadata[chunkIndex]
+        } else {
+            // Fallback to default ranges if chunk not found
+            chunkBounds = ChunkMetadata(
+                positionMin: quantizationRanges.positionMin,
+                positionMax: quantizationRanges.positionMax,
+                scaleMin: quantizationRanges.scaleMin,
+                scaleMax: quantizationRanges.scaleMax,
+                opacityMin: quantizationRanges.opacityMin,
+                opacityMax: quantizationRanges.opacityMax,
+                colorMin: SIMD3<Float>(quantizationRanges.colorMin, quantizationRanges.colorMin, quantizationRanges.colorMin),
+                colorMax: SIMD3<Float>(quantizationRanges.colorMax, quantizationRanges.colorMax, quantizationRanges.colorMax)
+            )
+        }
+        
         // Extract packed data - these are uint32 values, not lists
         let packedPosition = element.properties[packedPositionPropertyIndex]
         let packedRotation = element.properties[packedRotationPropertyIndex]
@@ -727,51 +845,94 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
         let packedColor = element.properties[packedColorPropertyIndex]
         
         // Unpack position from uint32
-        // splat-transform uses: 11 bits for x, 11 bits for y, 10 bits for z (total 32 bits)
+        // splat-transform uses: 11 bits for x, 10 bits for y, 11 bits for z (total 32 bits)
+        // Format: X (bits 21-31, 11 bits), Y (bits 11-20, 10 bits), Z (bits 0-10, 11 bits)
         let position: SIMD3<Float>
         if case .uint32(let posPacked) = packedPosition {
-            // Extract: x (bits 21-31, 11 bits), y (bits 10-20, 11 bits), z (bits 0-9, 10 bits)
-            let x = UInt16((posPacked >> 21) & 0x7FF)  // Bits 21-31 (11 bits)
-            let y = UInt16((posPacked >> 10) & 0x7FF)  // Bits 10-20 (11 bits)
-            let z = UInt16(posPacked & 0x3FF)          // Bits 0-9 (10 bits)
+            // Extract: x (bits 21-31, 11 bits), y (bits 11-20, 10 bits), z (bits 0-10, 11 bits)
+            let x = UInt16((posPacked >> 21) & 0x7FF)  // Bits 21-31 (11 bits, max 2047)
+            let y = UInt16((posPacked >> 11) & 0x3FF)   // Bits 11-20 (10 bits, max 1023)
+            let z = UInt16(posPacked & 0x7FF)           // Bits 0-10 (11 bits, max 2047)
             
+            // Use chunk-specific bounds for dequantization
             position = SIMD3<Float>(
-                x: dequantizeUInt16(x, min: quantizationRanges.positionMin.x, max: quantizationRanges.positionMax.x),
-                y: dequantizeUInt16(y, min: quantizationRanges.positionMin.y, max: quantizationRanges.positionMax.y),
-                z: dequantizeUInt16(z, min: quantizationRanges.positionMin.z, max: quantizationRanges.positionMax.z)
+                x: dequantizeUInt16(x, min: chunkBounds.positionMin.x, max: chunkBounds.positionMax.x, maxValue: 2047),
+                y: dequantizeUInt16(y, min: chunkBounds.positionMin.y, max: chunkBounds.positionMax.y, maxValue: 1023),
+                z: dequantizeUInt16(z, min: chunkBounds.positionMin.z, max: chunkBounds.positionMax.z, maxValue: 2047)
             )
         } else {
             print("[PackedElementInputMapping] ERROR: packed_position type: \(packedPosition)")
             throw CompressedPLYSceneReader.Error.invalidFileStructure("Invalid packed_position format: expected uint32, got \(packedPosition)")
         }
         
-        // Unpack rotation from uint32 (3x UInt8, smallest-three quaternion)
-        // Format: 3x 8-bit values packed into uint32 (bits 16-23, 8-15, 0-7)
+        // Unpack rotation from uint32 (smallest-three quaternion)
+        // Format: 2 bits for largest component index + 3x 10 bits for smallest components
+        // Bits 30-31: largest component index (0=x, 1=y, 2=z, 3=w)
+        // Bits 20-29: first smallest component (10 bits)
+        // Bits 10-19: second smallest component (10 bits)
+        // Bits 0-9: third smallest component (10 bits)
         let rotation: simd_quatf
         if case .uint32(let rotPacked) = packedRotation {
-            let q0 = UInt8((rotPacked >> 16) & 0xFF)  // Bits 16-23
-            let q1 = UInt8((rotPacked >> 8) & 0xFF)   // Bits 8-15
-            let q2 = UInt8(rotPacked & 0xFF)          // Bits 0-7
+            let largestIdx = UInt8((rotPacked >> 30) & 0x3)  // Bits 30-31
+            let q0 = UInt16((rotPacked >> 20) & 0x3FF)        // Bits 20-29 (10 bits, max 1023)
+            let q1 = UInt16((rotPacked >> 10) & 0x3FF)        // Bits 10-19 (10 bits, max 1023)
+            let q2 = UInt16(rotPacked & 0x3FF)                // Bits 0-9 (10 bits, max 1023)
             
-            rotation = decodeSmallestThreeQuaternion(q0: q0, q1: q1, q2: q2)
+            // Dequantize from [0, 1023] to [-1, 1] (signed)
+            let q0f = dequantizeUInt16(q0, min: -1.0, max: 1.0, maxValue: 1023)
+            let q1f = dequantizeUInt16(q1, min: -1.0, max: 1.0, maxValue: 1023)
+            let q2f = dequantizeUInt16(q2, min: -1.0, max: 1.0, maxValue: 1023)
+            
+            // Reconstruct quaternion based on which component is largest
+            let q0sq = q0f * q0f
+            let q1sq = q1f * q1f
+            let q2sq = q2f * q2f
+            let sumSq = q0sq + q1sq + q2sq
+            
+            if sumSq >= 1.0 {
+                // Invalid quaternion, return identity
+                rotation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+            } else {
+                let q3sq = 1.0 - sumSq
+                let q3 = sqrt(max(0, q3sq))
+                
+                // Determine sign of largest component (typically positive for normalized quaternions)
+                // In smallest-three encoding, the sign is usually positive, but we could extract it from additional bits if needed
+                let sign: Float = 1.0
+                
+                var quat = SIMD4<Float>(0, 0, 0, 0)
+                switch largestIdx {
+                case 0: quat = SIMD4<Float>(q3 * sign, q0f, q1f, q2f)  // x is largest
+                case 1: quat = SIMD4<Float>(q0f, q3 * sign, q1f, q2f)  // y is largest
+                case 2: quat = SIMD4<Float>(q0f, q1f, q3 * sign, q2f)  // z is largest
+                case 3: quat = SIMD4<Float>(q0f, q1f, q2f, q3 * sign)  // w is largest
+                default: quat = SIMD4<Float>(0, 0, 0, 1)  // Identity
+                }
+                
+                rotation = simd_quatf(ix: quat.x, iy: quat.y, iz: quat.z, r: quat.w).normalized
+            }
         } else {
             print("[PackedElementInputMapping] ERROR: packed_rotation type: \(packedRotation)")
             throw CompressedPLYSceneReader.Error.invalidFileStructure("Invalid packed_rotation format: expected uint32, got \(packedRotation)")
         }
         
-        // Unpack scale from uint32 (3x UInt8)
-        // Format: 3x 8-bit values packed into uint32 (bits 16-23, 8-15, 0-7)
+        // Unpack scale from uint32
+        // Format: 11 bits for x, 10 bits for y, 11 bits for z (same as position)
+        // Format: X (bits 21-31, 11 bits), Y (bits 11-20, 10 bits), Z (bits 0-10, 11 bits)
         let scale: SIMD3<Float>
         if case .uint32(let scalePacked) = packedScale {
-            let scaleX = UInt8((scalePacked >> 16) & 0xFF)  // Bits 16-23
-            let scaleY = UInt8((scalePacked >> 8) & 0xFF)   // Bits 8-15
-            let scaleZ = UInt8(scalePacked & 0xFF)          // Bits 0-7
+            let scaleX = UInt16((scalePacked >> 21) & 0x7FF)  // Bits 21-31 (11 bits, max 2047)
+            let scaleY = UInt16((scalePacked >> 11) & 0x3FF)   // Bits 11-20 (10 bits, max 1023)
+            let scaleZ = UInt16(scalePacked & 0x7FF)          // Bits 0-10 (11 bits, max 2047)
             
-            scale = SIMD3<Float>(
-                x: dequantizeUInt8(scaleX, min: quantizationRanges.scaleMin, max: quantizationRanges.scaleMax),
-                y: dequantizeUInt8(scaleY, min: quantizationRanges.scaleMin, max: quantizationRanges.scaleMax),
-                z: dequantizeUInt8(scaleZ, min: quantizationRanges.scaleMin, max: quantizationRanges.scaleMax)
+            // Scale is in log space, dequantize using chunk bounds then exponentiate
+            let scaleLog = SIMD3<Float>(
+                x: dequantizeUInt16(scaleX, min: chunkBounds.scaleMin, max: chunkBounds.scaleMax, maxValue: 2047),
+                y: dequantizeUInt16(scaleY, min: chunkBounds.scaleMin, max: chunkBounds.scaleMax, maxValue: 1023),
+                z: dequantizeUInt16(scaleZ, min: chunkBounds.scaleMin, max: chunkBounds.scaleMax, maxValue: 2047)
             )
+            // Scale is stored in log space, so we need to exponentiate
+            scale = SIMD3<Float>(exp(scaleLog.x), exp(scaleLog.y), exp(scaleLog.z))
         } else {
             print("[PackedElementInputMapping] ERROR: packed_scale type: \(packedScale)")
             throw CompressedPLYSceneReader.Error.invalidFileStructure("Invalid packed_scale format: expected uint32, got \(packedScale)")
@@ -787,17 +948,18 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
             let b = UInt8((colorPacked >> 8) & 0xFF)   // Bits 8-15
             let a = UInt8(colorPacked & 0xFF)          // Bits 0-7 (opacity)
             
+            // Use chunk-specific bounds for color dequantization
             sh0 = SIMD3<Float>(
-                x: dequantizeUInt8(r, min: quantizationRanges.colorMin, max: quantizationRanges.colorMax),
-                y: dequantizeUInt8(g, min: quantizationRanges.colorMin, max: quantizationRanges.colorMax),
-                z: dequantizeUInt8(b, min: quantizationRanges.colorMin, max: quantizationRanges.colorMax)
+                x: dequantizeUInt8(r, min: chunkBounds.colorMin.x, max: chunkBounds.colorMax.x),
+                y: dequantizeUInt8(g, min: chunkBounds.colorMin.y, max: chunkBounds.colorMax.y),
+                z: dequantizeUInt8(b, min: chunkBounds.colorMin.z, max: chunkBounds.colorMax.z)
             )
             
-            opacity = dequantizeUInt8(a, min: quantizationRanges.opacityMin, max: quantizationRanges.opacityMax)
+            opacity = dequantizeUInt8(a, min: chunkBounds.opacityMin, max: chunkBounds.opacityMax)
         } else {
             // Fallback: check if there's a separate packed_opacity property
             if let opacityIndex = packedOpacityPropertyIndex, case .uint32(let opacityPacked) = element.properties[opacityIndex] {
-                opacity = dequantizeUInt8(UInt8(opacityPacked & 0xFF), min: quantizationRanges.opacityMin, max: quantizationRanges.opacityMax)
+                opacity = dequantizeUInt8(UInt8(opacityPacked & 0xFF), min: chunkBounds.opacityMin, max: chunkBounds.opacityMax)
                 
                 // Color is just RGB (3 bytes)
                 if case .uint32(let colorPacked) = packedColor {
@@ -806,9 +968,9 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
                     let b = UInt8(colorPacked & 0xFF)          // Bits 0-7
                     
                     sh0 = SIMD3<Float>(
-                        x: dequantizeUInt8(r, min: quantizationRanges.colorMin, max: quantizationRanges.colorMax),
-                        y: dequantizeUInt8(g, min: quantizationRanges.colorMin, max: quantizationRanges.colorMax),
-                        z: dequantizeUInt8(b, min: quantizationRanges.colorMin, max: quantizationRanges.colorMax)
+                        x: dequantizeUInt8(r, min: chunkBounds.colorMin.x, max: chunkBounds.colorMax.x),
+                        y: dequantizeUInt8(g, min: chunkBounds.colorMin.y, max: chunkBounds.colorMax.y),
+                        z: dequantizeUInt8(b, min: chunkBounds.colorMin.z, max: chunkBounds.colorMax.z)
                     )
                 } else {
                     print("[PackedElementInputMapping] ERROR: packed_color type: \(packedColor)")
@@ -822,9 +984,36 @@ private struct PackedElementInputMapping: ElementInputMappingProtocol {
         
         result.position = position
         result.rotation = rotation
-        result.scale = .exponent(scale)
+        result.scale = .linearFloat(scale)  // Scale is already exponentiated above
         result.opacity = .logitFloat(opacity)
         result.color = .sphericalHarmonic([sh0])
+    }
+    
+    /// Update quantization ranges from chunk metadata
+    mutating func updateQuantizationRanges(
+        positionMin: SIMD3<Float>,
+        positionMax: SIMD3<Float>,
+        scaleMin: Float,
+        scaleMax: Float,
+        opacityMin: Float,
+        opacityMax: Float,
+        colorMin: SIMD3<Float>,
+        colorMax: SIMD3<Float>
+    ) {
+        // Use average of color min/max for scalar color range
+        let colorMinScalar = (colorMin.x + colorMin.y + colorMin.z) / 3.0
+        let colorMaxScalar = (colorMax.x + colorMax.y + colorMax.z) / 3.0
+        
+        quantizationRanges = CompressedPLYDecompressor.QuantizationRanges(
+            positionMin: positionMin,
+            positionMax: positionMax,
+            scaleMin: scaleMin,
+            scaleMax: scaleMax,
+            opacityMin: opacityMin,
+            opacityMax: opacityMax,
+            colorMin: colorMinScalar,
+            colorMax: colorMaxScalar
+        )
     }
 }
 
@@ -834,8 +1023,8 @@ private func dequantizeUInt8(_ value: UInt8, min: Float, max: Float) -> Float {
     return min + normalized * (max - min)
 }
 
-private func dequantizeUInt16(_ value: UInt16, min: Float, max: Float) -> Float {
-    let normalized = Float(value) * (1.0 / 65535.0)
+private func dequantizeUInt16(_ value: UInt16, min: Float, max: Float, maxValue: UInt16 = 65535) -> Float {
+    let normalized = Float(value) * (1.0 / Float(maxValue))
     return min + normalized * (max - min)
 }
 

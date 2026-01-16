@@ -14,20 +14,43 @@ internal struct CompressedPLYDecompressor {
         let positionMax: SIMD3<Float>
         
         // Scale quantization (log space, typically -20 to 20)
-        let scaleMin: Float = -20.0
-        let scaleMax: Float = 20.0
+        let scaleMin: Float
+        let scaleMax: Float
         
         // Rotation quantization (quaternion components, -1 to 1)
-        let rotationMin: Float = -1.0
-        let rotationMax: Float = 1.0
+        let rotationMin: Float
+        let rotationMax: Float
         
         // Opacity quantization (logit space, typically -10 to 10)
-        let opacityMin: Float = -10.0
-        let opacityMax: Float = 10.0
+        let opacityMin: Float
+        let opacityMax: Float
         
         // Color quantization (SH coefficients, typically -1 to 1)
-        let colorMin: Float = -1.0
-        let colorMax: Float = 1.0
+        let colorMin: Float
+        let colorMax: Float
+        
+        /// Custom initializer with all parameters
+        init(positionMin: SIMD3<Float>,
+             positionMax: SIMD3<Float>,
+             scaleMin: Float = -20.0,
+             scaleMax: Float = 20.0,
+             rotationMin: Float = -1.0,
+             rotationMax: Float = 1.0,
+             opacityMin: Float = -10.0,
+             opacityMax: Float = 10.0,
+             colorMin: Float = -1.0,
+             colorMax: Float = 1.0) {
+            self.positionMin = positionMin
+            self.positionMax = positionMax
+            self.scaleMin = scaleMin
+            self.scaleMax = scaleMax
+            self.rotationMin = rotationMin
+            self.rotationMax = rotationMax
+            self.opacityMin = opacityMin
+            self.opacityMax = opacityMax
+            self.colorMin = colorMin
+            self.colorMax = colorMax
+        }
         
         static let `default` = QuantizationRanges(
             positionMin: SIMD3<Float>(-100.0, -100.0, -100.0),
